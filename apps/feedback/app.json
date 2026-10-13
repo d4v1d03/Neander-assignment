@@ -1,0 +1,19 @@
+{
+  "name": "feedback",
+  "description": "Shared feedback posts that callers can vote on, at most one counted vote per caller per post.",
+  "collections": {
+    "posts": {
+      "author": {"type": "string"},
+      "text": {"type": "string"}
+    },
+    "votes": {
+      "post_id": {"type": "integer"},
+      "voter": {"type": "string"}
+    }
+  },
+  "handlers": {
+    "create_post": {"kind": "write", "args": {"text": {"type": "string"}}},
+    "list_posts": "read",
+    "vote": {"kind": "write", "args": {"post_id": {"type": "integer"}}}
+  }
+}

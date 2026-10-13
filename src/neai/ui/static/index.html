@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>neai</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1f2328; --muted: #656d76; --line: #d8dee4; --card: #f6f8fa;
+    --accent: #0969da; --accent-fg: #ffffff; --ok: #1a7f37; --ok-bg: #dafbe1;
+    --err: #cf222e; --err-bg: #ffebe9; --warn: #9a6700; --warn-bg: #fff8c5; --info-bg: #ddf4ff;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --fg: #e6edf3; --muted: #8d96a0; --line: #30363d; --card: #161b22;
+      --accent: #4493f8; --accent-fg: #0d1117; --ok: #3fb950; --ok-bg: #12261e;
+      --err: #f85149; --err-bg: #2d1214; --warn: #d29922; --warn-bg: #272115; --info-bg: #121d2f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--fg); }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 20px; border-bottom: 1px solid var(--line); }
+  .brand { font-weight: 700; font-size: 16px; color: var(--fg); text-decoration: none; }
+  .spacer { flex: 1; }
+  #home-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+  .layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: calc(100vh - 51px); }
+  aside { border-right: 1px solid var(--line); padding: 14px 10px; }
+  .aside-title { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); padding: 0 8px 6px; }
+  .app-link { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; color: var(--fg); text-decoration: none; }
+  .app-link:hover { background: var(--card); }
+  .app-link.active { background: var(--card); font-weight: 600; }
+  .app-link .name { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+  main { padding: 20px 28px 60px; max-width: 1000px; width: 100%; }
+  h1 { font-size: 22px; margin: 0; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  h3 { font-size: 13px; margin: 14px 0 6px; }
+  .title-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; margin: 14px 0; }
+  .muted { color: var(--muted); }
+  .small { font-size: 12px; }
+  code, .mono, pre { font-family: var(--mono); font-size: 12.5px; }
+  pre { margin: 8px 0 0; padding: 10px; background: var(--card); border-radius: 6px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+  button { white-space: nowrap; font: inherit; padding: 5px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--muted); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+  button:disabled { opacity: .5; cursor: default; }
+  input, select, textarea { font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  textarea { width: 100%; resize: vertical; display: block; }
+  textarea.code { font-family: var(--mono); font-size: 12.5px; line-height: 1.45; tab-size: 4; }
+  .form-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+  .badge { font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+  .tag { font-size: 11px; padding: 0 6px; border-radius: 4px; background: var(--card); border: 1px solid var(--line); color: var(--muted); }
+  .tag.write { color: var(--warn); }
+  .tag.read { color: var(--ok); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+  .dot.on { background: var(--ok); }
+  .dot.off { background: var(--line); }
+  .server-row { display: flex; align-items: center; gap: 10px; margin: 10px 0; flex-wrap: wrap; }
+  .box { border-radius: 6px; padding: 10px 12px; margin: 10px 0; border: 1px solid transparent; }
+  .box.ok { background: var(--ok-bg); border-color: var(--ok); }
+  .box.error { background: var(--err-bg); border-color: var(--err); }
+  .box.warn { background: var(--warn-bg); border-color: var(--warn); }
+  .box.info { background: var(--info-bg); border-color: var(--accent); }
+  .box pre { background: transparent; padding: 0; }
+  .box strong { font-family: var(--mono); }
+  .hint { margin-top: 4px; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; max-width: 320px; overflow-wrap: anywhere; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  ul.plain { list-style: none; padding: 0; margin: 0; }
+  ul.plain li { padding: 2px 0; }
+  ul.log { list-style: none; padding: 0; margin: 0; }
+  ul.log li { padding: 5px 0; border-bottom: 1px solid var(--line); }
+  ul.log li.error .msg { color: var(--err); }
+  ul.log li.warn .msg { color: var(--warn); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .empty { text-align: center; padding: 60px 20px; }
+  @media (max-width: 720px) {
+    .layout { grid-template-columns: 1fr; }
+    aside { border-right: 0; border-bottom: 1px solid var(--line); }
+    main { padding: 16px; }
+    .grid2 { grid-template-columns: 1fr; }
+    #home-path { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <a class="brand" href="#">neai</a>
+  <span class="muted small mono" id="home-path"></span>
+  <span class="spacer"></span>
+  <button class="primary" id="new-app">New app</button>
+</header>
+<div class="layout">
+  <aside>
+    <div class="aside-title">Apps</div>
+    <nav id="apps"></nav>
+  </aside>
+  <main id="main"></main>
+</div>
+<script>
+"use strict";
+// All page content is built with DOM APIs (textContent), never innerHTML: record data comes
+// from callers and must not be able to inject markup into the developer's UI.
+
+const state = { config: null, current: null, lastRequest: "" };
+const $ = (sel) => document.querySelector(sel);
+
+function h(tag, props, ...children) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null || v === false) continue;
+    if (k === "class") el.className = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const c of children.flat(Infinity)) {
+    if (c != null && c !== false) el.append(c instanceof Node ? c : String(c));
+  }
+  return el;
+}
+
+function put(el, ...children) {
+  el.replaceChildren(...children.flat(Infinity).filter((c) => c != null && c !== false));
+  return el;
+}
+
+async function api(path, body) {
+  const opts = body === undefined ? {} : {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  };
+  try {
+    const res = await fetch(path, opts);
+    return await res.json();
+  } catch (e) {
+    return { ok: false, error: { code: "UI_UNREACHABLE", message: "can't reach the neai ui server: " + e.message } };
+  }
+}
+
+const pretty = (v) => JSON.stringify(v, null, 2);
+const shortHash = (hash) => (hash || "").replace("sha256:", "").slice(0, 10);
+const clock = (iso) => (iso ? new Date(iso).toLocaleTimeString() : "");
+const cell = (v) => (v === undefined || v === null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v));
+const PLACEHOLDER = { string: "", integer: 1, number: 0, boolean: false, list: [], object: {} };
+const signature = (args) => Object.entries(args).map(([n, s]) => `${n} (${s.type}${s.required ? "" : ", optional"})`).join(", ");
+const argsTemplate = (handler) => JSON.stringify(Object.fromEntries(
+  Object.entries((handler && handler.args) || {}).filter(([, s]) => s.required).map(([n, s]) => [n, PLACEHOLDER[s.type]])));
+
+function errorBox(err, ...extra) {
+  return h("div", { class: "box error" },
+    h("div", {}, h("strong", {}, err.code), " ", err.message),
+    err.hint && h("div", { class: "hint small" }, "Hint: ", err.hint),
+    err.details && h("details", {}, h("summary", {}, "details"), h("pre", {}, pretty(err.details))),
+    ...extra);
+}
+
+function reviewBox(problems) {
+  return h("div", { class: "box warn" },
+    h("div", {}, "Safety check: deploy will be refused until these lines are removed."),
+    h("ul", {}, problems.map((p) => h("li", { class: "small" }, `line ${p.line}: ${p.problem}`))));
+}
+
+
+async function loadApps() {
+  const r = await api("/api/apps");
+  const nav = $("#apps");
+  put(nav);
+  if (!r.ok) return nav.append(errorBox(r.error));
+  if (!r.apps.length) nav.append(h("p", { class: "muted small", style: "padding: 0 8px" }, "No apps yet."));
+  for (const a of r.apps) {
+    nav.append(h("a", { href: "#app/" + a.name, class: "app-link" + (a.name === state.current ? " active" : "") },
+      h("span", { class: "dot " + (a.running ? "on" : "off"), title: a.running ? "running" : "stopped" }),
+      h("span", { class: "name" }, a.name),
+      h("span", { class: "badge" }, a.version ? "v" + a.version : "none")));
+  }
+}
+
+
+function showHome() {
+  state.current = null;
+  loadApps();
+  put($("#main"), h("div", { class: "empty" },
+    h("h1", {}, "Pick an app, or make one"),
+    h("p", { class: "muted" }, "Each app is an app.json contract plus a handlers.py file, deployed and run by neai."),
+    h("p", {}, h("button", { class: "primary", onclick: () => (location.hash = "#new") }, "New app")),
+    !state.config.ai.enabled && h("p", { class: "muted small" },
+      "Tip: set DEEPSEEK_API_KEY before starting ", h("code", {}, "neai ui"), " to generate apps from a description.")));
+}
+
+
+async function showApp(name) {
+  state.current = name;
+  loadApps();
+  const main = $("#main");
+  put(main, h("p", { class: "muted" }, "Loading..."));
+  const r = await api("/api/apps/" + encodeURIComponent(name));
+  if (!r.ok) return put(main, errorBox(r.error));
+  const v = r.active_version;
+  put(main, 
+    h("div", { class: "title-row" },
+      h("h1", {}, r.app.name),
+      v ? h("span", { class: "badge", title: v.hash }, `version ${v.version} · ${shortHash(v.hash)}`)
+        : h("span", { class: "badge" }, "no active version"),
+      h("span", { class: "spacer" }),
+      h("button", { onclick: () => (location.hash = "#edit/" + name) }, "Edit"),
+      h("button", { onclick: () => showApp(name) }, "Refresh")),
+    r.app.description && h("p", { class: "muted", style: "margin: 4px 0" }, r.app.description),
+    serverRow(name, r.server, v),
+    r.latest_rejected && h("div", {},
+      h("h3", {}, "The latest definition was rejected", v ? ` (version ${v.version} is still active)` : ""),
+      errorBox(r.latest_rejected.error)),
+    callCard(name, r.handlers, r.server.running),
+    h("div", { id: "panels" }, dataCard(r), activityCard(r.recent_logs)),
+    contractCard(r));
+}
+
+async function refreshPanels(name) {
+  const r = await api("/api/apps/" + encodeURIComponent(name));
+  if (r.ok && $("#panels")) put($("#panels"), dataCard(r), activityCard(r.recent_logs));
+}
+
+function serverRow(name, server, version) {
+  const startStop = async (action, button) => {
+    button.disabled = true;
+    button.textContent = action === "start" ? "Starting..." : "Stopping...";
+    const r = await api(`/api/apps/${name}/${action}`, {});
+    await showApp(name);
+    if (!r.ok) $("#main").insertBefore(errorBox(r.error), $("#main").children[2]);
+  };
+  return h("div", { class: "server-row" },
+    h("span", { class: "dot " + (server.running ? "on" : "off") }),
+    server.running ? h("span", {}, "Running at ", h("code", {}, server.url))
+                   : h("span", { class: "muted" }, "Server stopped"),
+    server.running
+      ? h("button", { onclick: (e) => startStop("stop", e.target) }, "Stop")
+      : h("button", { class: "primary", disabled: !version, onclick: (e) => startStop("start", e.target) }, "Start server"));
+}
+
+function callCard(name, handlers, running) {
+  const select = h("select", {}, handlers.map((x) => h("option", { value: x.name }, `${x.name}  (${x.kind})`)));
+  const caller = h("input", { value: "alice", size: 12, "aria-label": "caller" });
+  const args = h("textarea", { rows: 3, class: "code", spellcheck: "false", "aria-label": "args" });
+  const sig = h("div", { class: "muted small" });
+  const showArgs = () => {
+    const handler = handlers.find((x) => x.name === select.value);
+    args.value = argsTemplate(handler);
+    sig.textContent = handler && handler.args
+      ? "args: " + (signature(handler.args) || "none") : "args (JSON): not declared, so not checked by the platform";
+  };
+  select.addEventListener("change", showArgs);
+  showArgs();
+  const out = h("div");
+  const run = async (e) => {
+    let parsed;
+    try {
+      parsed = JSON.parse(args.value.trim() || "{}");
+    } catch (err) {
+      return put(out, errorBox({ code: "ARGS_INVALID", message: "args isn't valid JSON: " + err.message }));
+    }
+    e.target.disabled = true;
+    const r = await api(`/api/apps/${name}/call`, { handler: select.value, caller: caller.value, args: parsed });
+    e.target.disabled = false;
+    put(out, r.ok ? h("pre", {}, pretty(r.result)) : errorBox(r.error));
+    refreshPanels(name);
+  };
+  return h("section", { class: "card" },
+    h("h2", {}, "Try a handler"),
+    !running && h("p", { class: "muted small" }, "Start the server to call handlers."),
+    h("div", { class: "form-row" },
+      select, h("span", { class: "muted" }, "as"), caller,
+      h("button", { class: "primary", disabled: !running, onclick: run }, "Run")),
+    sig, args, out);
+}
+
+function dataCard(r) {
+  const sec = h("section", { class: "card" }, h("h2", {}, "Data"));
+  const collections = Object.entries(r.data);
+  if (!collections.length) sec.append(h("p", { class: "muted small" }, "No collections."));
+  for (const [coll, info] of collections) {
+    const fields = ["id", ...Object.keys(r.schema[coll] || {})];
+    sec.append(h("h3", {}, coll, " ", h("span", { class: "muted small" },
+      `${info.count} record${info.count === 1 ? "" : "s"}`)));
+    if (!info.records.length) {
+      sec.append(h("p", { class: "muted small" }, "Empty."));
+      continue;
+    }
+    sec.append(h("div", { class: "table-wrap" }, h("table", {},
+      h("thead", {}, h("tr", {}, fields.map((f) => h("th", {}, f)))),
+      h("tbody", {}, info.records.map((rec) => h("tr", {}, fields.map((f) => h("td", {}, cell(rec[f])))))))));
+    if (info.showing) sec.append(h("p", { class: "muted small" }, info.showing));
+  }
+  return sec;
+}
+
+function activityCard(logs) {
+  return h("section", { class: "card" },
+    h("h2", {}, "Recent activity"),
+    !logs.length ? h("p", { class: "muted small" }, "Nothing yet.")
+      : h("ul", { class: "log" }, logs.map((l) => h("li", { class: l.level },
+          h("span", { class: "muted mono small" }, clock(l.at)), " ",
+          h("span", { class: "tag" }, l.event), " ",
+          l.version && h("span", { class: "muted small" }, "v" + l.version + " "),
+          l.caller && h("span", { class: "muted" }, l.caller + " · "),
+          h("span", { class: "msg" }, l.message),
+          l.data && h("details", {}, h("summary", {}, "data"), h("pre", {}, pretty(l.data)))))));
+}
+
+function contractCard(r) {
+  return h("section", { class: "card" },
+    h("h2", {}, "Contract"),
+    h("div", { class: "grid2" },
+      h("div", {}, h("h3", {}, "Handlers"), h("ul", { class: "plain" }, r.handlers.map((x) =>
+        h("li", {}, h("code", {}, x.name), " ", h("span", { class: "tag " + x.kind }, x.kind),
+          x.args && h("div", { class: "muted small", style: "margin-left: 12px" }, signature(x.args) || "no arguments"))))),
+      h("div", {}, h("h3", {}, "Collections"), Object.entries(r.schema).map(([c, fields]) =>
+        h("div", {}, h("code", {}, c), h("ul", { class: "plain small", style: "margin: 2px 0 8px 12px" },
+          Object.entries(fields).map(([f, spec]) => h("li", {}, f, " ",
+            h("span", { class: "muted" }, spec.type + (spec.items ? ` of ${spec.items}` : "") + (spec.required ? "" : ", optional"))))))))),
+    h("p", { class: "muted small" }, "Deployed from ", h("code", {}, r.app.source_dir || "unknown")));
+}
+
+
+async function showEditor(mode, name) {
+  state.current = mode === "change" ? name : null;
+  loadApps();
+  let files = state.config.template;
+  let target = state.config.apps_dir + "/<name in app.json>";
+  if (mode === "change") {
+    const r = await api("/api/apps/" + encodeURIComponent(name));
+    if (!r.ok) return put($("#main"), errorBox(r.error));
+    files = r.files || files;
+    target = r.app.source_dir || state.config.apps_dir + "/" + name;
+  }
+  const ai = state.config.ai;
+  const appJson = h("textarea", { class: "code", rows: 16, spellcheck: "false", "aria-label": "app.json" });
+  const code = h("textarea", { class: "code", rows: 24, spellcheck: "false", "aria-label": "handlers.py" });
+  appJson.value = files.app_json;
+  code.value = files.handlers_py;
+  const current = () => ({ app_json: appJson.value, handlers_py: code.value });
+  const aiOut = h("div");
+  const result = h("div");
+
+  const prompt = h("textarea", { rows: 3, placeholder: mode === "new"
+    ? "Describe the app, e.g. \"a shared shopping list: anyone can add items, only the person who added an item can remove it\""
+    : "Describe the change, e.g. \"add an optional due date to notes and a handler that lists overdue ones\"" });
+  const genButton = h("button", { class: "primary", disabled: !ai.enabled }, `Generate with ${ai.provider}`);
+
+  async function generate(error) {
+    const request = prompt.value.trim() || state.lastRequest;
+    if (!request) return put(aiOut, h("p", { class: "muted small" }, "Describe what you want first."));
+    state.lastRequest = request;
+    genButton.disabled = true;
+    genButton.textContent = "Generating...";
+    put(aiOut, h("p", { class: "muted small" }, `Asking ${ai.model}; this can take a minute.`));
+    const send = mode === "change" || error;
+    const r = await api("/api/ai", { request, files: send ? current() : null, error: error || null });
+    genButton.disabled = false;
+    genButton.textContent = `Generate with ${ai.provider}`;
+    if (!r.ok) return put(aiOut, errorBox(r.error));
+    appJson.value = r.app_json;
+    code.value = r.handlers_py;
+    put(result);
+    put(aiOut, 
+      h("div", { class: "box info" }, h("b", {}, "Draft ready. "), r.summary, " Review the files below, then deploy."),
+      r.review.length ? reviewBox(r.review) : null);
+  }
+  genButton.addEventListener("click", () => generate(null));
+
+  const deployButton = h("button", { class: "primary" }, "Deploy");
+  async function deploy(overwrite) {
+    deployButton.disabled = true;
+    const r = await api("/api/deploy", { mode, app: name || null, ...current(), overwrite });
+    deployButton.disabled = false;
+    if (!r.ok && r.error && ["APP_EXISTS", "SOURCE_CHANGED"].includes(r.error.code)) {
+      if (confirm(`${r.error.message}.\n\n${r.error.hint || ""}`)) return deploy(true);
+      return put(result, errorBox(r.error));
+    }
+    if (r.ok) {
+      put(result, h("div", { class: "box ok" },
+        h("div", {}, r.status === "unchanged" ? "No changes: this is already the active version."
+                                              : `Deployed: ${r.app} is now on version ${r.version}.`),
+        (r.warnings || []).map((w) => h("div", { class: "small", style: "color: var(--warn)" }, "Warning: " + w)),
+        h("div", { class: "form-row" }, h("button", { onclick: () => (location.hash = "#app/" + r.app) }, `Open ${r.app}`))));
+      loadApps();
+      return;
+    }
+    const err = r.error || { code: "DEPLOY_FAILED", message: "deploy failed" };
+    put(result, 
+      r.active_version ? h("p", { class: "muted small" }, `Rejected. Version ${r.active_version} is still active and serving.`) : null,
+      errorBox(err, ai.enabled && h("div", { class: "form-row" },
+        h("button", { class: "primary", onclick: () => generate(err) }, "Fix with AI"),
+        h("span", { class: "muted small" }, "sends this error and the files back to the model"))));
+  }
+  deployButton.addEventListener("click", () => deploy(false));
+
+  put($("#main"), 
+    h("div", { class: "title-row" },
+      h("h1", {}, mode === "new" ? "New app" : `Edit ${name}`),
+      h("span", { class: "spacer" }),
+      mode === "change" && h("button", { onclick: () => (location.hash = "#app/" + name) }, "Back")),
+    h("section", { class: "card" },
+      h("h2", {}, "Build with AI"),
+      ai.enabled
+        ? [prompt, h("div", { class: "form-row" }, genButton, h("span", { class: "muted small" }, `model: ${ai.model}`)), aiOut]
+        : h("p", { class: "muted small" }, "Set DEEPSEEK_API_KEY in your shell and restart ", h("code", {}, "neai ui"),
+            " to generate apps from a description. You can still write the files yourself below.")),
+    h("section", { class: "card" },
+      h("h2", {}, "app.json"), appJson,
+      h("h2", { style: "margin-top: 14px" }, "handlers.py"), code,
+      h("div", { class: "form-row" }, deployButton,
+        h("span", { class: "muted small" }, "Checked for unsafe code, then validated by the platform before anything goes live.")),
+      h("div", { class: "muted small" }, "Deploy saves these files to ", h("code", {}, target),
+        " (the folder ", h("code", {}, "neai deploy"), " would use) and deploys into ", h("code", {}, state.config.home), "."),
+      result));
+}
+
+
+function route() {
+  const [view, name] = location.hash.slice(1).split("/");
+  if (view === "app" && name) showApp(decodeURIComponent(name));
+  else if (view === "edit" && name) showEditor("change", decodeURIComponent(name));
+  else if (view === "new") showEditor("new");
+  else showHome();
+}
+
+(async function init() {
+  const config = await api("/api/config");
+  if (!config.ok) return put($("#main"), errorBox(config.error));
+  state.config = config;
+  $("#home-path").textContent = config.home;
+  $("#new-app").addEventListener("click", () => (location.hash = "#new"));
+  window.addEventListener("hashchange", route);
+  route();
+})();
+</script>
+</body>
+</html>

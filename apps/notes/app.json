@@ -1,0 +1,30 @@
+{
+  "name": "notes",
+  "description": "Private notes: each caller can create, list, read and update only their own notes.",
+  "collections": {
+    "notes": {
+      "owner": {"type": "string"},
+      "title": {"type": "string"},
+      "body": {"type": "string", "required": false}
+    }
+  },
+  "handlers": {
+    "create_note": {
+      "kind": "write",
+      "args": {"title": {"type": "string"}, "body": {"type": "string", "required": false}}
+    },
+    "list_notes": "read",
+    "get_note": {
+      "kind": "read",
+      "args": {"id": {"type": "integer"}}
+    },
+    "update_note": {
+      "kind": "write",
+      "args": {
+        "id": {"type": "integer"},
+        "title": {"type": "string", "required": false},
+        "body": {"type": "string", "required": false}
+      }
+    }
+  }
+}
