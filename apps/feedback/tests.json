@@ -1,0 +1,17 @@
+{
+  "tests": [
+    {"name": "alice posts", "as": "alice", "call": "create_post", "args": {"text": "dark mode please"}, "save": "post",
+     "expect": {"result": {"author": "alice", "votes": 0}}},
+    {"name": "bob's vote counts", "as": "bob", "call": "vote", "args": {"post_id": "$post.id"},
+     "expect": {"result": {"counted": true, "votes": 1}}},
+    {"name": "bob's second vote doesn't", "as": "bob", "call": "vote", "args": {"post_id": "$post.id"},
+     "expect": {"result": {"counted": false, "votes": 1}}},
+    {"name": "anyone can read the posts", "call": "list_posts", "expect": {"result": [{"votes": 1, "voted_by_me": false}]}},
+    {"name": "bob sees his own vote", "as": "bob", "call": "list_posts", "expect": {"result": [{"voted_by_me": true}]}},
+    {"name": "only moderators delete", "as": "bob", "call": "delete_post", "args": {"post_id": "$post.id"},
+     "expect": {"error": "FORBIDDEN"}},
+    {"name": "a moderator can", "as": {"user": "mo", "roles": ["moderator"]}, "call": "delete_post",
+     "args": {"post_id": "$post.id"}, "expect": {"result": {"deleted": "$post.id"}}},
+    {"call": "list_posts", "expect": {"result": []}}
+  ]
+}

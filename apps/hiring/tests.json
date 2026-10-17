@@ -1,0 +1,29 @@
+{
+  "tests": [
+    {"name": "a recruiter posts an SDE1 job", "as": {"user": "rita", "roles": ["recruiter"]}, "call": "post_job",
+     "args": {"title": "Backend", "level": "SDE1"}, "save": "job"},
+    {"name": "candidates can't post jobs", "as": "sam", "call": "post_job", "args": {"title": "x", "level": "SDE1"},
+     "expect": {"error": "FORBIDDEN"}},
+    {"name": "sam (4 years) applies", "as": "sam", "call": "apply", "args": {"job_id": "$job.id", "experience_years": 4},
+     "save": "sam_app", "expect": {"result": {"stage": "applied", "level": "SDE1"}}},
+    {"name": "jo (1 year) applies", "as": "jo", "call": "apply", "args": {"job_id": "$job.id", "experience_years": 1},
+     "save": "jo_app"},
+    {"name": "an interviewer can't pass the recruiter's round", "as": {"user": "ivan", "roles": ["interviewer"]},
+     "call": "pass_round", "args": {"id": "$sam_app.id"}, "expect": {"error": "WORKFLOW_FORBIDDEN"}},
+    {"as": "rita", "call": "pass_round", "args": {"id": "$sam_app.id"}, "expect": {"result": {"to": "screening"}}},
+    {"name": "experienced SDE1 candidates skip the technical round", "as": "rita", "call": "pass_round",
+     "args": {"id": "$sam_app.id"}, "expect": {"result": {"from": "screening", "to": "manager", "skipped": ["technical"]}}},
+    {"as": "rita", "call": "pass_round", "args": {"id": "$jo_app.id"}},
+    {"name": "everyone else has the technical round", "as": "rita", "call": "pass_round", "args": {"id": "$jo_app.id"},
+     "expect": {"result": {"to": "technical", "skipped": []}}},
+    {"name": "reaching HR drafts an offer", "as": "ivan", "call": "pass_round", "args": {"id": "$sam_app.id"},
+     "expect": {"result": {"to": "hr"}}},
+    {"as": "sam", "call": "my_applications", "expect": {"result": [{"stage": "hr", "offer": {"salary": 1200000}}]}},
+    {"name": "candidates can't pass rounds", "as": "jo", "call": "pass_round", "args": {"id": "$jo_app.id"},
+     "expect": {"error": "FORBIDDEN"}},
+    {"as": "ivan", "call": "reject", "args": {"id": "$jo_app.id", "note": "not yet"},
+     "expect": {"result": {"to": "rejected", "finished": true}}},
+    {"name": "a finished application can't move", "as": "rita", "call": "pass_round", "args": {"id": "$jo_app.id"},
+     "expect": {"error": "WORKFLOW_FINISHED"}}
+  ]
+}

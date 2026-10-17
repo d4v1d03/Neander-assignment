@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import signal
 import sys
@@ -17,7 +16,7 @@ DEFAULT_UI_PORT = 8700
 PAGE = Path(__file__).with_name("static") / "index.html"
 CSP = ("default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; "
        "img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
-APP_ROUTE = re.compile(r"^/api/apps/([a-z][a-z0-9_-]{0,63})(?:/(call|start|stop))?$")
+APP_ROUTE = re.compile(r"^/api/apps/([a-z][a-z0-9_-]{0,63})(?:/(call|start|stop|users|signup|login|logout|me))?$")
 
 
 class UIServer(LocalServer):
@@ -44,6 +43,8 @@ class UIRequestHandler(LocalJSONHandler):
         m = APP_ROUTE.match(path)
         if m and not m.group(2):
             return self._respond(lambda: ui.app(m.group(1)))
+        if m and m.group(2) == "users":
+            return self._respond(lambda: ui.users(m.group(1)))
         self._not_found()
 
     def do_POST(self) -> None:
@@ -59,11 +60,17 @@ class UIRequestHandler(LocalJSONHandler):
             return self._respond(lambda: ui.deploy(body))
         if path == "/api/ai":
             return self._respond(lambda: ui.generate(body))
+        if path == "/api/ai/ui":
+            return self._respond(lambda: ui.generate_ui(body))
         m = APP_ROUTE.match(path)
         if m and m.group(2):
             name, action = m.groups()
             if action == "call":
                 return self._respond(lambda: ui.call(name, body))
+            if action == "users":
+                return self._respond(lambda: ui.users(name, body))
+            if action in ("signup", "login", "logout", "me"):
+                return self._respond(lambda: ui.auth(name, action, body))
             if action == "start":
                 return self._respond(lambda: ui.start(name))
             return self._respond(lambda: ui.stop(name))
@@ -78,7 +85,8 @@ class UIRequestHandler(LocalJSONHandler):
             err = NeaiError("INTERNAL_ERROR", f"{type(e).__name__}: {e}")
             return self._send(500, error_envelope(err))
         status = 200 if result.get("ok") else NeaiError(result["error"]["code"], "").http_status
-        self._send(status, result)
+        # Responses can carry login tokens and app data: never cache them.
+        self._send_bytes(status, json.dumps(result).encode(), "application/json", {"Cache-Control": "no-store"})
 
     def _not_found(self) -> None:
         err = NeaiError("ROUTE_NOT_FOUND", f"no route for {self.command} {self.path}")
@@ -91,12 +99,12 @@ def _running_ui(port: int) -> dict[str, Any] | None:
             config = json.loads(resp.read())
     except (OSError, ValueError):
         return None
-    return config if isinstance(config, dict) and config.get("ok") and "home" in config else None
+    return config if isinstance(config, dict) and config.get("ok") and "database" in config else None
 
 
-def serve_ui(home: str | os.PathLike[str] | None, apps_dir: str, *, port: int = DEFAULT_UI_PORT,
+def serve_ui(database: str | None, apps_dir: str, *, port: int = DEFAULT_UI_PORT,
              out: TextIO = sys.stdout, loaded_env: list[dict[str, Any]] | None = None) -> int:
-    ui = UI(home, apps_dir)
+    ui = UI(database, apps_dir)
     try:
         httpd = UIServer(port, ui)
     except OSError as e:
@@ -105,7 +113,7 @@ def serve_ui(home: str | os.PathLike[str] | None, apps_dir: str, *, port: int = 
             err = NeaiError("UI_ALREADY_RUNNING", f"neai ui is already running at http://{HOST}:{port}",
                             hint=f"just open http://{HOST}:{port}, or stop that one first (Ctrl+C in its terminal), "
                                  "or start another with --port",
-                            details={"url": f"http://{HOST}:{port}", "home": running.get("home")})
+                            details={"url": f"http://{HOST}:{port}", "database": running.get("database")})
         else:
             err = NeaiError("PORT_IN_USE", f"can't listen on {HOST}:{port}: {e.strerror}",
                             hint="another program is using this port; pick another with --port")
@@ -117,7 +125,7 @@ def serve_ui(home: str | os.PathLike[str] | None, apps_dir: str, *, port: int = 
         raise KeyboardInterrupt
 
     previous = signal.signal(signal.SIGTERM, stop)
-    out.write(json.dumps({"ok": True, "status": "serving", "url": url, "home": str(ui.home),
+    out.write(json.dumps({"ok": True, "status": "serving", "url": url, "database": ui.config()["database"],
                           "apps_dir": str(ui.apps_dir), "ai": ui.config()["ai"], "env_files": loaded_env or [],
                           "message": f"open {url} in your browser; Ctrl+C to stop"}) + "\n")
     out.flush()

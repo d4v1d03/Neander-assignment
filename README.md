@@ -1,80 +1,161 @@
 # neai: a small app platform for coding agents
 
-You write two files: `app.json`, which declares the data fields and handlers, and `handlers.py`, which holds the code. `neai` stores and validates the data, runs the app on localhost, and lets you inspect what happened. A new version only goes live after it passes validation, so a bad edit never costs data or takes down the version that works.
+An app on neai is a **contract** (`app.json`: data, handlers, who may call them) plus **code** (`handlers.py`). Three optional parts sit beside them:
+* a workflow (`workflows.json` and `workflows.py`) for records that move through steps;
+* a UI (`ui/`);
+* example tests (`tests.json`).
+
+neai stores and validates the data, gives every app its own sign-up and login, enforces the contract, runs the app, serves its UI, and tells you what happened. A new version only goes live after it passes every check and its own tests, so a bad edit never costs data or takes down the version that works.
+
+This is **v2**. v1, the original take-home with SQLite, is on `main`. v2 adds the four things the review asked for:
+* **Stateless servers.** All state lives in Postgres, so you can run any number of copies of an app behind one URL.
+* **Accounts and access rules for each app.** Real logins, plus `public` / `user` / role rules in the contract.
+* **Workflows.** Steps, rules about who may move a record, skip rules and hooks, as a third contract file.
+* **A UI for every app.** Its own `ui/` folder, or one generated from the contract.
+
+It also adds unique constraints, field defaults, rollback, and `tests.json`. [docs/v2-plan.md](docs/v2-plan.md) is the plan v2 was built from.
 
 ## Setup
 
-You need Python 3.9 or newer, on macOS or Linux. There are no other runtime dependencies. It's tested on Python 3.9, 3.11, 3.13 and 3.14 on macOS; Windows is untested.
+You need Python 3.11 or newer and Docker, on macOS or Linux. (macOS's built-in `python3` is too old: install one from python.org, Homebrew or pyenv.)
 
 ```bash
+docker compose up -d                     # Postgres on 127.0.0.1:5433: all state lives here
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip      # older pips (e.g. macOS's Python 3.9) can't do the next step
+python -m pip install --upgrade pip
 pip install -e ".[test]"
 neai --version
 ```
 
+`neai` finds the database through `NEAI_DATABASE_URL` (or `--db`); the default is the one `docker compose` starts. `docker compose stop` stops it. Your data stays in a Docker volume until `docker compose down -v`.
+
 ## What you can do
 
-### Run an example app
+### Run an app, with real accounts
 
 ```bash
-neai run apps/notes                 # serves on http://127.0.0.1:8710 (leave it running)
+neai run apps/notes                      # serves on http://127.0.0.1:8710; leave it running
 ```
 
-In a second terminal:
+In a second terminal, create two accounts (each asks for a password), then call as them:
 
 ```bash
+neai signup notes alice
+neai signup notes bob
 neai call notes create_note --as alice --args '{"title": "hello"}'
-neai call notes list_notes --as bob     # [] because bob can't see alice's notes
-neai inspect notes                      # version, handlers, data, logs, last rejection
+neai call notes list_notes --as bob      # []: bob can't see alice's notes
+neai inspect notes                       # version, handlers, data, accounts, logs, last rejection
 ```
 
-`apps/feedback` is the second example: shared posts with votes, where a repeat vote isn't counted twice.
+`--as alice` sends the login token that `neai signup` (or `neai login`) saved. Nobody can call as alice without her password, and accounts belong to one app.
+
+### Roles and public data
+
+`apps/feedback` has public posts that anyone can read, even without logging in. Logged-in users post and vote; a repeat vote isn't counted twice, and a `unique` rule backs that up. Only users with the `moderator` role can delete posts. Roles are declared in `app.json`, and the operator grants them:
+
+```bash
+neai users feedback grant alice moderator
+```
+
+### Workflows: records that move through steps
+
+Many apps have records that go through a **process**:
+* an expense claim through manager and finance approval;
+* an order through packing and shipping;
+* a support ticket through triage;
+* a document through review;
+* a job application through interview rounds.
+
+`workflows.json` describes such a process as data:
+* the steps, in order;
+* which role may move a record out of each step;
+* rules that skip a step for some records, e.g. "claims under 100 skip finance review" or "urgent tickets skip triage";
+* hooks in `workflows.py` that run when a record reaches a step;
+* early exits such as `rejected`.
+
+A handler just calls `ctx.workflow.advance(...)`. The platform checks the role, applies the rules, runs the hook and records the history, all in the handler's transaction. The engine is generic: nothing in it knows about any particular process.
+
+`apps/hiring` is the example app that ships with neai: five interview rounds, where SDE1 candidates with 3+ years of experience skip the technical round, and reaching the HR round drafts an offer.
+
+```bash
+neai run apps/hiring --port 8720         # leave it running; then, in another terminal:
+neai signup hiring rita && neai users hiring grant rita recruiter
+neai signup hiring sam
+neai call hiring post_job --as rita --args '{"title": "Backend SDE1", "level": "SDE1"}'
+neai call hiring apply --as sam --args '{"job_id": 1, "experience_years": 4}'
+neai call hiring pass_round --as rita --args '{"id": 2}'      # applied -> screening
+neai call hiring pass_round --as rita --args '{"id": 2}'      # screening -> manager, "skipped": ["technical"]
+```
+
+### A UI for every app
+
+Every app server is also its app's website. For example, open http://127.0.0.1:8720 for hiring:
+* **Hiring has its own `ui/`.** Candidates apply and see a tracker of their rounds, with skipped ones struck through, and their offer. Recruiters and interviewers get a pipeline board, where Pass only works for the rounds their role may pass.
+* **Notes has no `ui/`, so it gets a UI generated from its contract:** log in, then one form per handler.
+
+UIs are plain HTML, CSS and JavaScript:
+* They use `/_neai/sdk.js` for login and calls.
+* They're deployed and versioned with the app, and served with a strict Content-Security-Policy.
+* You can write them by hand, paste them into the dashboard editor, or have DeepSeek write one there.
+
+### Tests that guard every deploy
+
+`tests.json` lists example calls and what they should return. Every `neai deploy` and `neai validate` runs them first, against an empty sandbox copy of the app, in a transaction that's always rolled back. If a change breaks a promise, such as a skip rule, a permission or an ownership check, the deploy is rejected with the expected and actual values, and the working version keeps running. For example, after a change to hiring's skip rule:
+
+```
+TESTS_FAILED: tests[6] "experienced SDE1 candidates skip the technical round" failed:
+              result.to: expected "manager", got "technical"
+```
+
+### Stateless servers: many copies, one URL
+
+App servers keep nothing on their own disk. The code itself is loaded from the database. So you can run as many copies as you like, and put the small load balancer in front:
+
+```bash
+neai serve notes --port 5001             # (one terminal each)
+neai serve notes --port 5002
+neai proxy notes --port 5100             # round-robin over every live copy; skips dead ones
+neai ps notes                            # the running copies
+```
+
+A login made on one copy works on the others. Kill a copy and the proxy keeps answering. Writes to one app still happen one at a time across all copies, using a lock in Postgres.
 
 ### Build your own app
 
 ```bash
-neai new todo --dir apps/todo           # a working skeleton
-# edit apps/todo/app.json and apps/todo/handlers.py
-neai deploy apps/todo                   # validated first; rejected with a clear reason if broken
+neai new todo --dir apps/todo            # app.json, handlers.py, workflows.json and a passing tests.json
+# edit the files
+neai deploy apps/todo                    # checked, tested, then activated; or rejected, with the reason
 ```
 
 [AGENTS.md](AGENTS.md) is the complete guide, written so a coding agent can follow it on its own.
 
-### Use the web UI
+### The dashboard, and building apps with AI
 
 ```bash
-neai ui                                 # then open http://127.0.0.1:8700
+neai ui                                  # then open http://127.0.0.1:8700
 ```
 
-In the UI you can:
-* browse apps and their data;
-* start and stop servers;
-* call handlers as any caller;
-* read logs and rejected deploys;
-* edit and deploy code.
+In the dashboard you can:
+* browse apps, their data, workflows and logs;
+* start and stop servers, and open an app's own UI;
+* sign in as an app's user and call handlers as them;
+* manage accounts and roles;
+* edit every file of an app in tabs, and deploy it.
 
-### Build apps with AI (DeepSeek)
+**To build with DeepSeek,** copy `.env.example` to `.env` and put your key after `DEEPSEEK_API_KEY=`. `.env` is git-ignored; run `chmod 600 .env` too.
+* **Generate** writes the backend: app.json, handlers.py, tests.json, and the workflow files when the app has a process.
+* **Generate UI** writes `ui/index.html`.
+* **Fix with AI** sends a rejected deploy's error back to the model.
 
-Put your key in a `.env` file in the project root. Copy `.env.example`, which shows the format; `.env` itself is git-ignored:
-
-```bash
-cp .env.example .env && chmod 600 .env   # then paste your key after DEEPSEEK_API_KEY=
-neai ui
-```
-
-`neai` reads `.env` from the folder you run it in, then from the project root. A variable `export`ed in your shell takes priority. The key stays on your machine: it's never sent to the browser or logged, and `neai ui` only reports which variable *names* it loaded.
-
-Click **New app** (or **Edit** on an app), describe what you want, and click **Generate**. Review the code, then click **Deploy**. If the platform rejects it, click **Fix with AI** to send the error back to the model.
-
-The default model is `deepseek-flash`. To use another model, set `DEEPSEEK_MODEL=deepseek-v4-pro`.
+The key stays on your machine: it's never sent to the browser or written to logs. The default model is `deepseek-flash`; set `DEEPSEEK_MODEL` to use another.
 
 ### Run the demo and the tests
 
 ```bash
-python scripts/demo.py                  # both apps, restart, code update, rejected definitions (22 checks)
-pytest                                  # 83 tests
+python scripts/demo.py                   # every feature, end to end, in its own scratch database (44 checks)
+pytest                                   # 165 tests, in a separate neai_test database
 ```
 
 ## Commands
@@ -82,67 +163,65 @@ pytest                                  # 83 tests
 | Command | What it does |
 |---|---|
 | `neai new <name>` | create a skeleton app |
-| `neai validate <dir>` | check a definition without activating it |
-| `neai deploy <dir>` | validate, then activate (or reject, and say why) |
+| `neai validate <dir>` / `neai deploy <dir>` | check (contract, code, tests, stored data) / then activate, or reject with the reason |
 | `neai run <dir>` | deploy if changed, then serve on localhost |
-| `neai call <app> <handler> --as <caller> --args '<json>'` | call a handler |
-| `neai inspect <app>` | identity, active version, handlers, data, logs, last rejection |
-| `neai logs <app>` | recent calls and errors |
-| `neai ui` | the web UI |
+| `neai serve <app>` / `neai ps` / `neai proxy <app>` | serve from the database (any number of copies) / list them / one URL in front of them |
+| `neai signup`, `login`, `logout <app> <user>` / `neai logins` | accounts; the login is saved for `neai call` |
+| `neai call <app> <handler> --as <user> --args '<json>'` | call a handler as that user (leave out `--as` for a public handler) |
+| `neai users <app> list\|add\|grant\|revoke\|passwd\|unlock\|remove` | the operator's account and role tools |
+| `neai inspect <app>` / `neai logs <app>` | everything about an app / recent calls and errors |
+| `neai versions <app>` / `neai rollback <app> --to N` | list versions / deploy an old one again, with every check |
+| `neai ui` | the dashboard |
 
-Every command prints JSON. Every error has a `code`, a `message` and a `hint` saying how to fix it.
+Every command prints JSON. Every error has a stable `code`, a `message` and a `hint` saying how to fix it.
 
 ## How it works
 
-* **The contract is data.** `app.json` is checked and inspected without running any code.
-* **Handlers get `ctx.caller` and `ctx.db`.** Read handlers get a read-only handle: any write fails with `READ_ONLY_VIOLATION`.
-* **Handlers can declare their arguments** in `app.json`. The platform checks them before the handler runs, and the error names the bad argument.
-* **Each write handler is one transaction.** If it fails, nothing is written.
-* **One runtime runs every app,** and each app has its own SQLite file.
-* **Deploys validate first:** the manifest, the code import, the handlers, and whether the schema still fits stored data. A rejected deploy leaves the last good version running.
+* **The contracts are data.** `app.json`, `workflows.json` and `tests.json` are checked against each other at deploy, without running app code. Errors name the path: `workflows.hiring.steps[2].skip_if.level`.
+* **Handlers get `ctx.caller`, `ctx.user`, `ctx.db` and `ctx.workflow`.** The caller comes from a verified login token, never from the request. Access rules (`public`, `user`, a role) are checked before the handler runs.
+* **Each write handler is one transaction,** including workflow moves and their hooks. If it fails, nothing is written. Read handlers get a read-only handle, and a read-only database transaction too.
+* **Workflows own the step field.** Handlers call `ctx.workflow.advance(...)`; the platform checks the step's role, applies the skip rules, runs hooks and records the history.
+* **Servers are stateless.** Data, code, users, sessions, logs and the list of running servers all live in Postgres. Every row is tagged with its app.
+* **Deploys check everything first:** the contracts, the code import and the functions it must define, the UI files, the app's own tests in a sandbox, and whether stored data still fits. A rejected deploy leaves the working version running.
 
 ## Design decisions
 
-* **Contract as JSON, code as Python.** The contract stays readable even when the code is broken.
-* **A schema change is accepted only if existing data still fits it.** That's one simple rule, with no migrations.
-* **A single-threaded server.** Writes are sequential with no locking code.
-* **The standard library only.** Setup is one install command.
-* **Inspection reads the store directly.** It works when the server is down, and no network endpoint exposes all the data.
+* **Contracts as JSON, code as Python.** The contract stays readable and checkable even when the code is broken.
+* **A schema change is accepted only if stored data still fits it,** or a `default` makes it fit. One rule, no migration engine.
+* **The platform runs accounts; apps never see passwords.** Bearer tokens, stored only as hashes, work the same way for the browser, the CLI and agents.
+* **Rules first as data, then Python.** Skip rules are JSON, checked at deploy. `{"function": ...}` is the escape hatch.
+* **Synchronous workflows.** A move is part of the handler's transaction, not a background job: stronger guarantees, far less machinery.
+* **UIs are untrusted.** Each runs on its own origin, under a strict Content-Security-Policy, talking to its own server only through the helper library.
+* **Scale by copies, not threads.** Stateless single-threaded servers, plus a per-app write lock in Postgres.
 
-**Rejected alternatives:**
-* **Decorators in a single Python file.** The contract could only be read by running the code, so a broken file couldn't even be inspected.
-* **A SQL table per collection.** Every schema change would become DDL and migration work, and validation happens in Python anyway.
-* **JSON files on disk.** There are no transactions, so a failing handler could leave half-finished writes.
-* **Hot reload by watching files.** It can pick up half-saved files, and it never tells the agent whether the change was accepted.
-* **The platform scoping data by caller automatically.** The brief puts scoping in handlers, and shared data (feedback posts) needs reads across callers.
-* **FastAPI or Click.** Good tools, but not needed: the standard library keeps setup to one command.
-
-[DESIGN.md](DESIGN.md) has the full reasoning, the safety measures, and what I'd do next.
+[DESIGN.md](DESIGN.md) has the full reasoning, the rejected alternatives, the safety measures and what I'd do next.
 
 ## Assumptions
 
-* **What counts as the schema:** only collections and fields. Adding or changing handlers is a code update.
-* **Schema changes:** accepted only if all stored data still fits the new schema (e.g. a new optional field). Anything else is rejected with `SCHEMA_INCOMPATIBLE`.
-* **Validation:**
-  * Every insert and update is validated against the declared fields (string, integer, number, boolean, list, object).
-  * Declared handler arguments are checked before the handler runs.
-  * Stored data is only re-checked when a deploy changes the schema, since that's the only time old records can stop fitting.
-* **A caught read-only violation still fails the call.** A read handler can't hide a write attempt with `try/except`.
-* **Caller identity:** any non-empty, printable string of up to 256 characters, sent with each request.
-* **Rejections and fallback:** a rejected deploy never stops the running version. `inspect` shows the latest rejection until a later deploy succeeds.
-* **Notes privacy:** another caller's note looks exactly like a note that doesn't exist (`NOTE_NOT_FOUND`).
-* **Feedback votes:** posts are visible to everyone, but voters aren't. A repeat vote succeeds without counting. There's no un-voting.
-* **"One app at a time":** one app per server process. Separate servers can run side by side on different ports.
-* **Inspection** is a trusted local operation. It reads the store directly and isn't exposed over HTTP.
+* **What counts as the schema:** collections, fields, `unique` rules and workflow steps. Changing handlers, access rules or tests is a code update.
+* **Accounts belong to one app,** and the operator is whoever holds the database credentials. There's no separate platform login.
+* **Ownership** ("only your notes") is decided in handler code; **roles** go in the contract.
+* **Notes privacy:** another user's note looks exactly like a note that doesn't exist (`NOTE_NOT_FOUND`).
+* **Feedback votes:** posts are public, voters aren't. A repeat vote succeeds without counting. There's no un-voting.
+* **Workflows:** one per collection. Steps go forward in order (with skips and early exits); a branch is two steps with opposite skip rules. Who may reject or withdraw is up to the handler.
+* **Inspection** (`inspect`, `logs`, `users`) is a trusted operator tool that reads the database directly.
 
-## Known limitation
+## Known limitations
 
-Handler code runs inside the server process. Read-only handles and data separation are API guarantees, not a security sandbox. There's more on this in [DESIGN.md](DESIGN.md).
+Handler code runs inside the server process. Access rules, read-only handles and per-app data are enforced by the platform's API, but they are not a security sandbox against hostile code. Workflow steps can't run on a timer (e.g. "auto-reject after 14 days"), and apps can't call outside services. More in [DESIGN.md](DESIGN.md).
 
 ## Safety
 
-Servers only listen on localhost and refuse cross-site requests. App data is private to your user. Handlers time out and roll back. Secrets are redacted from logs. AI-written code is checked and only runs when you deploy it. [DESIGN.md](DESIGN.md) lists what's built in, and what I'd do with a couple of days.
+* **Network:** servers only listen on localhost, check the Host header, and only accept JSON POSTs.
+* **Passwords and tokens:** passwords are stored as scrypt hashes and tokens as SHA-256 hashes, so a database dump reveals neither. Five wrong passwords lock an account for 15 minutes.
+* **Handlers** time out and roll back.
+* **Secrets are redacted** from logs.
+* **AI-written code** is checked, shown to you, and only runs when you deploy it.
+* **App UIs** can only load their own files and talk to their own server.
+
+[DESIGN.md](DESIGN.md) lists every protection.
 
 ## Time spent
 
-About 6 hours, within the limit: the assignment arrived at 2:00 PM and was submitted before 8:00 PM on 13 October 2026, including planning, the platform, tests, docs and the demo.
+* **v1** took about 6 hours: the assignment arrived at 2:00 PM and was submitted before 8:00 PM on 13 October 2026.
+* **v2** was built from 15 to 17 October 2026, in six phases, each ending with the tests passing.

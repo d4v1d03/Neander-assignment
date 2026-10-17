@@ -1,0 +1,19 @@
+{
+  "workflows": {
+    "hiring": {
+      "description": "Five rounds, then hired. Experienced SDE1 candidates skip the technical round.",
+      "collection": "applications",
+      "field": "stage",
+      "steps": [
+        {"name": "applied", "by": "recruiter"},
+        {"name": "screening", "by": "recruiter"},
+        {"name": "technical", "by": "interviewer",
+         "skip_if": {"level": "SDE1", "experience_years": {">=": 3}}},
+        {"name": "manager", "by": "interviewer"},
+        {"name": "hr", "by": "recruiter", "on_enter": "prepare_offer"},
+        "hired"
+      ],
+      "exits": ["rejected", "withdrawn"]
+    }
+  }
+}

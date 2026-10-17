@@ -77,6 +77,14 @@
   ul.log li.error .msg { color: var(--err); }
   ul.log li.warn .msg { color: var(--warn); }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+  .spinner { display: inline-block; width: 10px; height: 10px; border: 2px solid var(--line); border-top-color: var(--accent);
+             border-radius: 50%; animation: spin .8s linear infinite; vertical-align: -1px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .tab { font-family: var(--mono); font-size: 12px; padding: 3px 10px; }
+  .tab.active { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
+  .tab.empty:not(.active) { opacity: .55; }
+  a { color: var(--accent); }
   .empty { text-align: center; padding: 60px 20px; }
   @media (max-width: 720px) {
     .layout { grid-template-columns: 1fr; }
@@ -106,7 +114,9 @@
 // All page content is built with DOM APIs (textContent), never innerHTML: record data comes
 // from callers and must not be able to inject markup into the developer's UI.
 
-const state = { config: null, current: null, lastRequest: "" };
+// logins: per app, {user, token} of whoever signed in through "Try a handler". Page memory only:
+// a reload signs out, and the token is never written to storage.
+const state = { config: null, current: null, lastRequest: "", logins: {} };
 const $ = (sel) => document.querySelector(sel);
 
 function h(tag, props, ...children) {
@@ -146,6 +156,8 @@ const clock = (iso) => (iso ? new Date(iso).toLocaleTimeString() : "");
 const cell = (v) => (v === undefined || v === null ? "" : typeof v === "object" ? JSON.stringify(v) : String(v));
 const PLACEHOLDER = { string: "", integer: 1, number: 0, boolean: false, list: [], object: {} };
 const signature = (args) => Object.entries(args).map(([n, s]) => `${n} (${s.type}${s.required ? "" : ", optional"})`).join(", ");
+const accessText = (a) => (Array.isArray(a) ? a.join(" or ") : a);
+const accessClass = (a) => (a === "public" ? "read" : Array.isArray(a) ? "write" : "");
 const argsTemplate = (handler) => JSON.stringify(Object.fromEntries(
   Object.entries((handler && handler.args) || {}).filter(([, s]) => s.required).map(([n, s]) => [n, PLACEHOLDER[s.type]])));
 
@@ -160,7 +172,7 @@ function errorBox(err, ...extra) {
 function reviewBox(problems) {
   return h("div", { class: "box warn" },
     h("div", {}, "Safety check: deploy will be refused until these lines are removed."),
-    h("ul", {}, problems.map((p) => h("li", { class: "small" }, `line ${p.line}: ${p.problem}`))));
+    h("ul", {}, problems.map((p) => h("li", { class: "small" }, `${p.file ? p.file + " " : ""}line ${p.line}: ${p.problem}`))));
 }
 
 
@@ -212,7 +224,8 @@ async function showApp(name) {
     r.latest_rejected && h("div", {},
       h("h3", {}, "The latest definition was rejected", v ? ` (version ${v.version} is still active)` : ""),
       errorBox(r.latest_rejected.error)),
-    callCard(name, r.handlers, r.server.running),
+    callCard(name, r.handlers, r.server.running, r.auth),
+    usersCard(name, Boolean(v)),
     h("div", { id: "panels" }, dataCard(r), activityCard(r.recent_logs)),
     contractCard(r));
 }
@@ -232,16 +245,63 @@ function serverRow(name, server, version) {
   };
   return h("div", { class: "server-row" },
     h("span", { class: "dot " + (server.running ? "on" : "off") }),
-    server.running ? h("span", {}, "Running at ", h("code", {}, server.url))
+    server.running ? h("span", {}, "Running at ", h("code", {}, server.url), " ",
+      h("a", { href: server.url + "/", target: "_blank", rel: "noopener" }, "Open the app's UI"))
                    : h("span", { class: "muted" }, "Server stopped"),
     server.running
       ? h("button", { onclick: (e) => startStop("stop", e.target) }, "Stop")
       : h("button", { class: "primary", disabled: !version, onclick: (e) => startStop("start", e.target) }, "Start server"));
 }
 
-function callCard(name, handlers, running) {
-  const select = h("select", {}, handlers.map((x) => h("option", { value: x.name }, `${x.name}  (${x.kind})`)));
-  const caller = h("input", { value: "alice", size: 12, "aria-label": "caller" });
+function signInBox(name, auth, running) {
+  const login = state.logins[name];
+  if (login) {
+    const signOut = async () => {
+      await api(`/api/apps/${name}/logout`, { token: login.token });
+      delete state.logins[name];
+      showApp(name);
+    };
+    const rolesText = (user) => (user.roles.length ? "roles: " + user.roles.join(", ") : "no roles");
+    const roles = h("span", { class: "muted small" }, rolesText(login.user));
+    // Ask the app who this token belongs to now: roles may have changed, or the login been revoked.
+    api(`/api/apps/${name}/me`, { token: login.token }).then((r) => {
+      if (r.ok) {
+        login.user = r.user;
+        roles.textContent = rolesText(r.user);
+      } else if (r.error && r.error.code === "AUTH_INVALID") {
+        delete state.logins[name];
+        showApp(name);
+      }
+    });
+    return h("div", { class: "form-row" },
+      h("span", {}, "Signed in as ", h("b", {}, login.user.username)), roles,
+      h("button", { onclick: signOut }, "Sign out"));
+  }
+  const user = h("input", { size: 12, placeholder: "username", "aria-label": "username", autocomplete: "off" });
+  const pass = h("input", { size: 16, type: "password", placeholder: "password", "aria-label": "password",
+                            autocomplete: "off" });
+  const out = h("span", { class: "small" });
+  const go = async (action) => {
+    const r = await api(`/api/apps/${name}/${action}`, { username: user.value.trim(), password: pass.value });
+    pass.value = "";
+    if (!r.ok) return put(out, h("span", { style: "color: var(--err)" }, `${r.error.code}: ${r.error.message}`));
+    state.logins[name] = { user: r.user, token: r.token };
+    showApp(name);
+  };
+  const closed = auth.signup !== "open";
+  return h("div", {},
+    h("div", { class: "form-row" }, user, pass,
+      h("button", { class: "primary", disabled: !running, onclick: () => go("login") }, "Log in"),
+      h("button", { disabled: !running || closed, onclick: () => go("signup"),
+                    title: closed ? "sign-up is closed for this app: add accounts in Users below" : "" }, "Sign up"),
+      out),
+    h("div", { class: "muted small" },
+      "Not signed in, so only public handlers will answer. Accounts belong to this app only."));
+}
+
+function callCard(name, handlers, running, auth) {
+  const select = h("select", {}, handlers.map((x) =>
+    h("option", { value: x.name }, `${x.name}  (${x.kind} · ${accessText(x.access)})`)));
   const args = h("textarea", { rows: 3, class: "code", spellcheck: "false", "aria-label": "args" });
   const sig = h("div", { class: "muted small" });
   const showArgs = () => {
@@ -260,19 +320,76 @@ function callCard(name, handlers, running) {
     } catch (err) {
       return put(out, errorBox({ code: "ARGS_INVALID", message: "args isn't valid JSON: " + err.message }));
     }
+    const login = state.logins[name];
     e.target.disabled = true;
-    const r = await api(`/api/apps/${name}/call`, { handler: select.value, caller: caller.value, args: parsed });
+    const r = await api(`/api/apps/${name}/call`, { handler: select.value, args: parsed, token: login ? login.token : null });
     e.target.disabled = false;
+    if (!r.ok && r.error.code === "AUTH_INVALID") delete state.logins[name];  // expired or logged out elsewhere
     put(out, r.ok ? h("pre", {}, pretty(r.result)) : errorBox(r.error));
     refreshPanels(name);
   };
   return h("section", { class: "card" },
     h("h2", {}, "Try a handler"),
-    !running && h("p", { class: "muted small" }, "Start the server to call handlers."),
-    h("div", { class: "form-row" },
-      select, h("span", { class: "muted" }, "as"), caller,
+    !running && h("p", { class: "muted small" }, "Start the server to sign in and call handlers."),
+    signInBox(name, auth, running),
+    h("div", { class: "form-row" }, select,
       h("button", { class: "primary", disabled: !running, onclick: run }, "Run")),
     sig, args, out);
+}
+
+function usersCard(name, hasVersion) {
+  const sec = h("section", { class: "card" }, h("h2", {}, "Users"), h("p", { class: "muted small" }, "Loading..."));
+  const load = async () => {
+    const r = await api(`/api/apps/${encodeURIComponent(name)}/users`);
+    if (!r.ok) return put(sec, h("h2", {}, "Users"), errorBox(r.error));
+    const msg = h("div");
+    const act = async (body) => {
+      const res = await api(`/api/apps/${name}/users`, body);
+      if (!res.ok) return put(msg, errorBox(res.error));
+      const login = state.logins[name];
+      if (login && login.user.username === body.username) showApp(name);  // the signed-in user changed
+      else load();
+    };
+    const rows = r.users.map((u) => {
+      const grantable = r.roles.filter((role) => !u.roles.includes(role));
+      const pick = h("select", { "aria-label": "role to grant" }, grantable.map((role) => h("option", { value: role }, role)));
+      const revoke = (role) => (e) => { e.preventDefault(); act({ action: "revoke", username: u.username, role }); };
+      const remove = () => confirm(`Remove ${u.username}? Their sessions end; records they created stay.`)
+        && act({ action: "remove", username: u.username });
+      return h("tr", {},
+        h("td", {}, u.username, u.locked && h("span", { class: "badge", style: "margin-left: 6px" }, "locked")),
+        h("td", {}, u.roles.length
+          ? u.roles.map((role) => h("span", { class: "tag", style: "margin-right: 4px" }, role, " ",
+              h("a", { href: "#", title: `revoke ${role}`, onclick: revoke(role) }, "×")))
+          : h("span", { class: "muted" }, "none")),
+        h("td", {}, grantable.length ? h("span", { class: "form-row", style: "margin: 0" }, pick,
+          h("button", { onclick: () => act({ action: "grant", username: u.username, role: pick.value }) }, "Grant")) : null),
+        h("td", { class: "muted small" }, `${u.active_sessions} session${u.active_sessions === 1 ? "" : "s"}`),
+        h("td", {}, u.locked && h("button", { onclick: () => act({ action: "unlock", username: u.username }) }, "Unlock"),
+          " ", h("button", { onclick: remove }, "Remove")));
+    });
+    const newUser = h("input", { size: 12, placeholder: "username", "aria-label": "new username", autocomplete: "off" });
+    const newPass = h("input", { size: 18, type: "password", placeholder: "password (8+ characters)",
+                                 "aria-label": "new password", autocomplete: "new-password" });
+    const boxes = r.roles.map((role) => ({ role, box: h("input", { type: "checkbox" }) }));
+    const add = () => act({ action: "add", username: newUser.value.trim(), password: newPass.value,
+                            roles: boxes.filter((b) => b.box.checked).map((b) => b.role) });
+    put(sec,
+      h("h2", {}, "Users"),
+      h("p", { class: "muted small" }, `Sign-up is ${r.signup || "not set"}; roles in app.json: ${r.roles.join(", ") || "none"}. `,
+        "This panel is the operator's view: the app's users sign in through the app's own server."),
+      r.users.length
+        ? h("div", { class: "table-wrap" }, h("table", {},
+            h("thead", {}, h("tr", {}, ["user", "roles", "", "", ""].map((t) => h("th", {}, t)))),
+            h("tbody", {}, rows)))
+        : h("p", { class: "muted small" }, "No accounts yet."),
+      hasVersion && h("div", { class: "form-row" }, newUser, newPass,
+        boxes.map(({ role, box }) => h("label", { class: "small" }, box, " ", role)),
+        h("button", { onclick: add }, "Add user")),
+      msg);
+  };
+  load();
+  return sec;
 }
 
 function dataCard(r) {
@@ -313,18 +430,56 @@ function contractCard(r) {
     h("h2", {}, "Contract"),
     h("div", { class: "grid2" },
       h("div", {}, h("h3", {}, "Handlers"), h("ul", { class: "plain" }, r.handlers.map((x) =>
-        h("li", {}, h("code", {}, x.name), " ", h("span", { class: "tag " + x.kind }, x.kind),
+        h("li", {}, h("code", {}, x.name), " ", h("span", { class: "tag " + x.kind }, x.kind), " ",
+          h("span", { class: "tag " + accessClass(x.access), title: "who may call it" }, accessText(x.access)),
           x.args && h("div", { class: "muted small", style: "margin-left: 12px" }, signature(x.args) || "no arguments"))))),
       h("div", {}, h("h3", {}, "Collections"), Object.entries(r.schema).map(([c, fields]) =>
         h("div", {}, h("code", {}, c), h("ul", { class: "plain small", style: "margin: 2px 0 8px 12px" },
           Object.entries(fields).map(([f, spec]) => h("li", {}, f, " ",
             h("span", { class: "muted" }, spec.type + (spec.items ? ` of ${spec.items}` : "") + (spec.required ? "" : ", optional"))))))))),
+    workflowsBlock(r.workflows || {}),
+    h("p", { class: "muted small" }, `Accounts: sign-up ${r.auth.signup}, roles ${r.auth.roles.join(", ") || "none"}, `
+      + `${r.auth.users} user${r.auth.users === 1 ? "" : "s"}.`),
     h("p", { class: "muted small" }, "Deployed from ", h("code", {}, r.app.source_dir || "unknown")));
 }
 
 
+function workflowsBlock(workflows) {
+  const names = Object.keys(workflows);
+  if (!names.length) return null;
+  return h("div", {}, h("h3", {}, "Workflows"), names.map((n) => {
+    const wf = workflows[n];
+    const count = (step) => wf.records_per_step[step] || 0;
+    const chain = wf.steps.map((s, i) => h("span", {},
+      i ? h("span", { class: "muted" }, " → ") : null,
+      h("code", {}, s.name),
+      h("span", { class: "muted small" }, ` (${count(s.name)})`),
+      s.by && h("span", { class: "tag", title: "who may pass this step" }, s.by.join(" or ")),
+      s.skip_if && h("span", { class: "tag write", title: "skip_if " + JSON.stringify(s.skip_if) }, "skip rule"),
+      s.on_enter && h("span", { class: "tag read", title: "on_enter hook in workflows.py" }, s.on_enter)));
+    return h("div", { style: "margin: 4px 0 10px" },
+      h("div", {}, h("b", {}, n), h("span", { class: "muted small" }, ` on ${wf.collection}.${wf.field}`),
+        wf.description && h("div", { class: "muted small" }, wf.description)),
+      h("div", { class: "small", style: "line-height: 2" }, chain),
+      wf.exits.length ? h("div", { class: "muted small" }, "exits: ",
+        wf.exits.map((x) => `${x} (${count(x)})`).join(", ")) : null);
+  }));
+}
+
+const STANDARD_FILES = ["app.json", "handlers.py", "workflows.json", "workflows.py", "tests.json", "ui/index.html"];
+const FILE_HELP = {
+  "app.json": "The contract: data, handlers, who may call them, roles.",
+  "handlers.py": "The handlers' code.",
+  "workflows.json": "Optional: the steps records move through, with who may move them and skip rules.",
+  "workflows.py": "Optional: the hooks and conditions workflows.json names.",
+  "tests.json": "Optional: example calls and what they should return; every deploy runs them in a sandbox first.",
+  "ui/index.html": "Optional: the app's own UI, served at /. Without it, the app gets a UI generated from its contract.",
+};
+const REQUIRED_FILES = ["app.json", "handlers.py"];
+
 async function showEditor(mode, name) {
   state.current = mode === "change" ? name : null;
+  let lastSent = null;  // the files this editor last deployed, so overwriting its own attempt isn't a conflict
   loadApps();
   let files = state.config.template;
   let target = state.config.apps_dir + "/<name in app.json>";
@@ -332,48 +487,111 @@ async function showEditor(mode, name) {
     const r = await api("/api/apps/" + encodeURIComponent(name));
     if (!r.ok) return put($("#main"), errorBox(r.error));
     files = r.files || files;
+    lastSent = r.files || null;  // what the folder held when the editor opened it
     target = r.app.source_dir || state.config.apps_dir + "/" + name;
   }
   const ai = state.config.ai;
-  const appJson = h("textarea", { class: "code", rows: 16, spellcheck: "false", "aria-label": "app.json" });
-  const code = h("textarea", { class: "code", rows: 24, spellcheck: "false", "aria-label": "handlers.py" });
-  appJson.value = files.app_json;
-  code.value = files.handlers_py;
-  const current = () => ({ app_json: appJson.value, handlers_py: code.value });
+  const texts = {};
+  const holder = h("div");
+  const help = h("div", { class: "muted small", style: "margin-bottom: 6px" });
+  const tabBar = h("div", { class: "tabs" });
+  let active = "app.json";
+  const area = (n, text) => {
+    const t = h("textarea", { class: "code", rows: 24, spellcheck: "false", "aria-label": n });
+    t.value = text || "";
+    t.addEventListener("input", () => renderTabs());
+    texts[n] = t;
+    return t;
+  };
+  [...new Set([...STANDARD_FILES, ...Object.keys(files)])].forEach((n) => area(n, files[n]));
+  function renderTabs() {
+    put(tabBar, Object.keys(texts).map((n) => h("button", {
+      class: "tab" + (n === active ? " active" : "") + (texts[n].value.trim() ? "" : " empty"),
+      title: texts[n].value.trim() ? n : `${n} (none yet)`, onclick: () => showTab(n) }, n)),
+      h("button", { class: "tab", title: "add another file to the app's UI", onclick: addFile }, "+ UI file"));
+  }
+  function showTab(n) {
+    active = n;
+    put(holder, texts[n]);
+    help.textContent = FILE_HELP[n] || `Part of the app's UI, served at /${n.slice(3)}.`;
+    renderTabs();
+  }
+  function addFile() {
+    const n = (window.prompt("Name of the UI file, e.g. style.css or app.js") || "").trim().replace(/^ui\//, "");
+    if (!n) return;
+    const key = "ui/" + n;
+    if (!texts[key]) area(key, "");
+    showTab(key);
+  }
+  function setFiles(newFiles) {
+    for (const [n, text] of Object.entries(newFiles)) (texts[n] || area(n, "")).value = text;
+    showTab(Object.keys(newFiles)[0] || active);
+  }
+  // Empty optional files mean "the app doesn't have this file": they aren't sent, and deploy removes them.
+  const current = () => Object.fromEntries(Object.entries(texts).map(([n, t]) => [n, t.value])
+    .filter(([n, v]) => v.trim() || REQUIRED_FILES.includes(n)));
+  showTab(active);
+
   const aiOut = h("div");
   const result = h("div");
-
   const prompt = h("textarea", { rows: 3, placeholder: mode === "new"
     ? "Describe the app, e.g. \"a shared shopping list: anyone can add items, only the person who added an item can remove it\""
     : "Describe the change, e.g. \"add an optional due date to notes and a handler that lists overdue ones\"" });
   const genButton = h("button", { class: "primary", disabled: !ai.enabled }, `Generate with ${ai.provider}`);
+  const uiButton = h("button", { disabled: !ai.enabled, title: "writes ui/index.html from the app's files; "
+    + "the description box (optional) says what the UI should be like" }, "Generate UI");
 
-  async function generate(error) {
+  // Shows its progress on the button that was clicked and next to it (out), not somewhere off-screen.
+  async function ask(button, busy, path, body, done, out) {
+    const label = button.textContent;
+    const others = [genButton, uiButton, deployButton].filter((b) => b !== button);
+    button.disabled = true;
+    button.textContent = busy;
+    others.forEach((b) => (b.disabled = true));
+    put(out, h("p", { class: "muted small" }, h("span", { class: "spinner" }),
+      ` Asking ${ai.model}; this can take a minute.`));
+    out.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    const before = current();
+    const r = await api(path, body);
+    button.disabled = false;
+    button.textContent = label;
+    others.forEach((b) => (b.disabled = b !== deployButton && !ai.enabled));
+    if (!r.ok) return put(out, errorBox(r.error));
+    const changed = Object.keys(r.files).filter((n) => (before[n] || "") !== r.files[n]);
+    setFiles(r.files);
+    const message = [h("div", { class: "box info" }, h("b", {}, "Draft ready. "), r.summary, " ",
+        changed.length ? `Changed: ${changed.join(", ")}. ` : "Nothing changed. ", done),
+      r.review && r.review.length ? reviewBox(r.review) : null];
+    if (result.contains(out)) {
+      put(result, message);  // a fix: the old error no longer applies to the new files
+    } else {
+      put(result);
+      put(out, message);
+    }
+  }
+  async function generate(error, button, out) {
     const request = prompt.value.trim() || state.lastRequest;
-    if (!request) return put(aiOut, h("p", { class: "muted small" }, "Describe what you want first."));
+    if (!request && !error) return put(aiOut, h("p", { class: "muted small" }, "Describe what you want first."));
     state.lastRequest = request;
-    genButton.disabled = true;
-    genButton.textContent = "Generating...";
-    put(aiOut, h("p", { class: "muted small" }, `Asking ${ai.model}; this can take a minute.`));
     const send = mode === "change" || error;
-    const r = await api("/api/ai", { request, files: send ? current() : null, error: error || null });
-    genButton.disabled = false;
-    genButton.textContent = `Generate with ${ai.provider}`;
-    if (!r.ok) return put(aiOut, errorBox(r.error));
-    appJson.value = r.app_json;
-    code.value = r.handlers_py;
-    put(result);
-    put(aiOut, 
-      h("div", { class: "box info" }, h("b", {}, "Draft ready. "), r.summary, " Review the files below, then deploy."),
-      r.review.length ? reviewBox(r.review) : null);
+    const body = { request: request || "Fix the app so it deploys.", files: send ? current() : null, error: error || null };
+    if (error) {
+      await ask(button, "Fixing...", "/api/ai", body, "Review the changed tabs, then Deploy again.", out);
+    } else {
+      await ask(genButton, "Generating...", "/api/ai", body, "Review the files, then deploy.", aiOut);
+    }
   }
   genButton.addEventListener("click", () => generate(null));
+  uiButton.addEventListener("click", () => ask(uiButton, "Generating...", "/api/ai/ui",
+    { request: prompt.value.trim(), files: current() }, "Review ui/index.html, then deploy.", aiOut));
 
   const deployButton = h("button", { class: "primary" }, "Deploy");
   async function deploy(overwrite) {
     deployButton.disabled = true;
-    const r = await api("/api/deploy", { mode, app: name || null, ...current(), overwrite });
+    const sending = current();
+    const r = await api("/api/deploy", { mode, app: name || null, files: sending, overwrite, previous: lastSent });
     deployButton.disabled = false;
+    if (r.dir) lastSent = sending;  // the files reached the folder (deployed or rejected)
     if (!r.ok && r.error && ["APP_EXISTS", "SOURCE_CHANGED"].includes(r.error.code)) {
       if (confirm(`${r.error.message}.\n\n${r.error.hint || ""}`)) return deploy(true);
       return put(result, errorBox(r.error));
@@ -388,15 +606,17 @@ async function showEditor(mode, name) {
       return;
     }
     const err = r.error || { code: "DEPLOY_FAILED", message: "deploy failed" };
-    put(result, 
+    const fixOut = h("div");  // the fix's progress and result, right under its button; the error stays visible
+    put(result,
       r.active_version ? h("p", { class: "muted small" }, `Rejected. Version ${r.active_version} is still active and serving.`) : null,
       errorBox(err, ai.enabled && h("div", { class: "form-row" },
-        h("button", { class: "primary", onclick: () => generate(err) }, "Fix with AI"),
-        h("span", { class: "muted small" }, "sends this error and the files back to the model"))));
+        h("button", { class: "primary", onclick: (e) => generate(err, e.currentTarget, fixOut) }, "Fix with AI"),
+        h("span", { class: "muted small" }, "sends this error and the files back to the model"))),
+      fixOut);
   }
   deployButton.addEventListener("click", () => deploy(false));
 
-  put($("#main"), 
+  put($("#main"),
     h("div", { class: "title-row" },
       h("h1", {}, mode === "new" ? "New app" : `Edit ${name}`),
       h("span", { class: "spacer" }),
@@ -404,16 +624,15 @@ async function showEditor(mode, name) {
     h("section", { class: "card" },
       h("h2", {}, "Build with AI"),
       ai.enabled
-        ? [prompt, h("div", { class: "form-row" }, genButton, h("span", { class: "muted small" }, `model: ${ai.model}`)), aiOut]
+        ? [prompt, h("div", { class: "form-row" }, genButton, uiButton, h("span", { class: "muted small" }, `model: ${ai.model}`)), aiOut]
         : h("p", { class: "muted small" }, "Set DEEPSEEK_API_KEY in your shell and restart ", h("code", {}, "neai ui"),
             " to generate apps from a description. You can still write the files yourself below.")),
     h("section", { class: "card" },
-      h("h2", {}, "app.json"), appJson,
-      h("h2", { style: "margin-top: 14px" }, "handlers.py"), code,
+      h("h2", {}, "Files"), tabBar, help, holder,
       h("div", { class: "form-row" }, deployButton,
-        h("span", { class: "muted small" }, "Checked for unsafe code, then validated by the platform before anything goes live.")),
+        h("span", { class: "muted small" }, "Code is checked for unsafe calls, then the platform validates everything before it goes live.")),
       h("div", { class: "muted small" }, "Deploy saves these files to ", h("code", {}, target),
-        " (the folder ", h("code", {}, "neai deploy"), " would use) and deploys into ", h("code", {}, state.config.home), "."),
+        " (the folder ", h("code", {}, "neai deploy"), " would use) and deploys into the database at ", h("code", {}, state.config.database), "."),
       result));
 }
 
@@ -430,7 +649,7 @@ function route() {
   const config = await api("/api/config");
   if (!config.ok) return put($("#main"), errorBox(config.error));
   state.config = config;
-  $("#home-path").textContent = config.home;
+  $("#home-path").textContent = config.database;
   $("#new-app").addEventListener("click", () => (location.hash = "#new"));
   window.addEventListener("hashchange", route);
   route();

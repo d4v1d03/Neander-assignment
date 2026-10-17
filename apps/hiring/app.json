@@ -1,0 +1,55 @@
+{
+  "name": "hiring",
+  "description": "Job applications that move through a five-round hiring workflow. Candidates apply and follow their applications; recruiters and interviewers move them through the rounds.",
+  "auth": {"signup": "open", "roles": ["recruiter", "interviewer"]},
+  "collections": {
+    "jobs": {
+      "title": {"type": "string"},
+      "level": {"type": "string"},
+      "open": {"type": "boolean", "default": true}
+    },
+    "applications": {
+      "candidate": {"type": "string"},
+      "job_id": {"type": "integer"},
+      "level": {"type": "string"},
+      "experience_years": {"type": "number"},
+      "stage": {"type": "string", "required": false}
+    },
+    "offers": {
+      "application_id": {"type": "integer"},
+      "candidate": {"type": "string"},
+      "level": {"type": "string"},
+      "salary": {"type": "integer"}
+    }
+  },
+  "unique": {"applications": [["candidate", "job_id"]], "offers": [["application_id"]]},
+  "handlers": {
+    "list_jobs": {"kind": "read", "access": "public", "description": "open jobs; anyone can look"},
+    "post_job": {
+      "kind": "write", "access": "recruiter",
+      "args": {"title": {"type": "string"}, "level": {"type": "string"}}
+    },
+    "close_job": {"kind": "write", "access": "recruiter", "args": {"job_id": {"type": "integer"}}},
+    "apply": {
+      "kind": "write",
+      "args": {"job_id": {"type": "integer"}, "experience_years": {"type": "number"}},
+      "description": "apply to an open job; the application starts at the first round"
+    },
+    "my_applications": {"kind": "read", "description": "your applications, their round, and any offer"},
+    "withdraw": {"kind": "write", "args": {"id": {"type": "integer"}}},
+    "list_applications": {
+      "kind": "read", "access": ["recruiter", "interviewer"],
+      "args": {"stage": {"type": "string", "required": false}}
+    },
+    "pass_round": {
+      "kind": "write", "access": ["recruiter", "interviewer"],
+      "args": {"id": {"type": "integer"}, "note": {"type": "string", "required": false}},
+      "description": "pass the application's current round (each round says who may pass it)"
+    },
+    "reject": {
+      "kind": "write", "access": ["recruiter", "interviewer"],
+      "args": {"id": {"type": "integer"}, "note": {"type": "string", "required": false}}
+    },
+    "history": {"kind": "read", "args": {"id": {"type": "integer"}}, "description": "every move of one application"}
+  }
+}

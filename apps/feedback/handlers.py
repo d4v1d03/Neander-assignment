@@ -27,9 +27,18 @@ def vote(ctx, args):
     }
 
 
+def delete_post(ctx, args):
+    post_id = args["post_id"]
+    if ctx.db.get("posts", post_id) is None:
+        raise AppError("POST_NOT_FOUND", f"no post with id {post_id!r}")
+    for v in ctx.db.find("votes", where={"post_id": post_id}):
+        ctx.db.delete("votes", v["id"])
+    ctx.db.delete("posts", post_id)
+    ctx.log("post deleted", id=post_id, by=ctx.caller)
+    return {"deleted": post_id}
+
+
 def _with_votes(ctx, post):
-    return {
-        **post,
-        "votes": ctx.db.count("votes", where={"post_id": post["id"]}),
-        "voted_by_me": ctx.db.count("votes", where={"post_id": post["id"], "voter": ctx.caller}) > 0,
-    }
+    # list_posts is public: an anonymous reader (ctx.caller is None) has voted on nothing.
+    mine = ctx.caller is not None and ctx.db.count("votes", where={"post_id": post["id"], "voter": ctx.caller}) > 0
+    return {**post, "votes": ctx.db.count("votes", where={"post_id": post["id"]}), "voted_by_me": mine}

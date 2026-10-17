@@ -1,6 +1,7 @@
 {
   "name": "feedback",
-  "description": "Shared feedback posts that callers can vote on, at most one counted vote per caller per post.",
+  "description": "Shared feedback posts that anyone can read; logged-in users post and vote (one counted vote per user per post); moderators can delete posts.",
+  "auth": {"signup": "open", "roles": ["moderator"]},
   "collections": {
     "posts": {
       "author": {"type": "string"},
@@ -11,9 +12,11 @@
       "voter": {"type": "string"}
     }
   },
+  "unique": {"votes": [["post_id", "voter"]]},
   "handlers": {
     "create_post": {"kind": "write", "args": {"text": {"type": "string"}}},
-    "list_posts": "read",
-    "vote": {"kind": "write", "args": {"post_id": {"type": "integer"}}}
+    "list_posts": {"kind": "read", "access": "public"},
+    "vote": {"kind": "write", "args": {"post_id": {"type": "integer"}}},
+    "delete_post": {"kind": "write", "access": "moderator", "args": {"post_id": {"type": "integer"}}}
   }
 }

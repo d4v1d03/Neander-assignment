@@ -1,0 +1,18 @@
+{
+  "tests": [
+    {"name": "alice creates a note", "as": "alice", "call": "create_note",
+     "args": {"title": "groceries", "body": "milk"}, "save": "note",
+     "expect": {"result": {"owner": "alice", "title": "groceries", "body": "milk"}}},
+    {"name": "alice lists her notes", "as": "alice", "call": "list_notes", "expect": {"result": [{"title": "groceries"}]}},
+    {"name": "bob sees none of them", "as": "bob", "call": "list_notes", "expect": {"result": []}},
+    {"name": "bob can't read alice's note", "as": "bob", "call": "get_note", "args": {"id": "$note.id"},
+     "expect": {"error": "NOTE_NOT_FOUND"}},
+    {"name": "bob can't change it", "as": "bob", "call": "update_note", "args": {"id": "$note.id", "title": "mine"},
+     "expect": {"error": "NOTE_NOT_FOUND"}},
+    {"name": "alice can", "as": "alice", "call": "update_note", "args": {"id": "$note.id", "body": "milk, eggs"},
+     "expect": {"result": {"id": "$note.id", "body": "milk, eggs"}}},
+    {"name": "a blank title is refused", "as": "alice", "call": "create_note", "args": {"title": "  "},
+     "expect": {"error": "INVALID_ARGS"}},
+    {"name": "nobody logged in gets nothing", "call": "list_notes", "expect": {"error": "AUTH_REQUIRED"}}
+  ]
+}

@@ -1,4 +1,4 @@
-import sqlite3
+import psycopg
 
 from conftest import err, ok, write_app
 
@@ -90,10 +90,10 @@ def test_notes_are_scoped_to_the_caller(deployed):
     assert updated == {"id": a["id"], "owner": "alice", "title": "alice's", "body": "more"}
 
 
-def test_caller_is_required_and_checked(deployed):
+def test_anonymous_and_malformed_callers(deployed):
     notes = deployed("notes")
-    assert err(notes.call("list_notes", None))["code"] == "CALLER_REQUIRED"
-    assert err(notes.call("list_notes", ""))["code"] == "CALLER_REQUIRED"
+    assert err(notes.call("list_notes", None))["code"] == "AUTH_REQUIRED"  # notes has no public handlers
+    assert err(notes.call("list_notes", ""))["code"] == "CALLER_INVALID"
     assert err(notes.call("list_notes", 42))["code"] == "CALLER_INVALID"
     assert err(notes.call("list_notes", " alice"))["code"] == "CALLER_INVALID"
 
@@ -119,7 +119,8 @@ def test_write_from_read_handler_fails_with_structured_error(deployed, tmp_path)
     e = err(rt.call("sneaky_read", "alice"))
     assert e["code"] == "READ_ONLY_VIOLATION"
     insert_line = PROBE_CODE.splitlines().index('    ctx.db.insert("things", {"label": "should never be stored"})') + 1
-    assert e["details"] == {"handler": "sneaky_read", "op": "insert", "collection": "things", "line": insert_line}
+    assert e["details"] == {"handler": "sneaky_read", "op": "insert", "collection": "things",
+                            "file": "handlers.py", "line": insert_line}
     assert "hint" in e
     assert ok(rt.call("count", "alice")) == 0
 
@@ -162,17 +163,16 @@ def test_unknown_handler_and_bad_args(deployed):
     assert err(notes.call("list_notes", "alice", ["not", "an", "object"]))["code"] == "ARGS_INVALID"
 
 
-def test_apps_have_separate_data(home, deployed, tmp_path):
+def test_apps_have_separate_data(database, deployed, tmp_path):
     notes = deployed("notes")
     fb = deployed("feedback")
     rt = probe(deployed, tmp_path)
     ok(notes.call("create_note", "alice", {"title": "only in notes"}))
     ok(fb.call("create_post", "alice", {"text": "only in feedback"}))
 
-    files = {notes.store.path, fb.store.path, rt.store.path}
-    assert len(files) == 3
-    with sqlite3.connect(fb.store.path) as conn:
-        assert {c for (c,) in conn.execute("SELECT DISTINCT collection FROM records")} == {"posts"}
+    with psycopg.connect(database) as conn:
+        rows = conn.execute("SELECT app, collection, count(*) FROM neai_records GROUP BY 1, 2 ORDER BY 1").fetchall()
+    assert rows == [("feedback", "posts", 1), ("notes", "notes", 1)]
 
     e = err(rt.call("touch_other_app", "alice"))
     assert e["code"] == "UNKNOWN_COLLECTION"

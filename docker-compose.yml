@@ -1,0 +1,21 @@
+# The database server neai v2 keeps all state in. Local development only: the password is not a
+# secret and the port is bound to 127.0.0.1. In a cloud, point NEAI_DATABASE_URL at a managed Postgres.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: neai
+      POSTGRES_PASSWORD: neai
+      POSTGRES_DB: neai
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - neai-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U neai -d neai"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  neai-pg:

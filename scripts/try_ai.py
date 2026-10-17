@@ -10,11 +10,14 @@ import sys
 import tempfile
 from pathlib import Path
 
+from neai.auth import User
 from neai.deploy import deploy
 from neai.dotenv import load_dotenv
 from neai.errors import NeaiError
 from neai.runtime import Runtime
 from neai.ui import ai, codecheck
+
+from _scratchdb import scratch_database
 
 DEFAULT_REQUEST = ("a shared shopping list: anyone can add items and mark them bought; "
                    "only the person who added an item can delete it")
@@ -36,16 +39,18 @@ def ask(request: str, current: dict | None = None, error: dict | None = None) ->
     return draft
 
 
-def deploy_with_fixes(home: Path, src: Path, request: str, draft: dict) -> tuple[dict, dict]:
+def deploy_with_fixes(home: str, src: Path, request: str, draft: dict) -> tuple[dict, dict]:
     for attempt in range(MAX_FIXES + 1):
-        problems = codecheck.check(draft["handlers_py"])
+        files = draft["files"]
+        problems = [p for f in ("handlers.py", "workflows.py") if f in files for p in codecheck.check(files[f])]
         if problems:
             print(f"  safety check flagged: {problems}")
-            error = {"code": "UNSAFE_CODE", "message": "handlers.py failed the safety check", "details": {"problems": problems}}
+            error = {"code": "UNSAFE_CODE", "message": "the code failed the safety check", "details": {"problems": problems}}
         else:
             src.mkdir(parents=True, exist_ok=True)
-            (src / "app.json").write_text(draft["app_json"])
-            (src / "handlers.py").write_text(draft["handlers_py"])
+            for name, text in files.items():
+                (src / name).write_text(text)
+            print(f"  files: {', '.join(files)}")
             result = deploy(home, src)
             print(f"  deploy: {result['status']}" + (f" version {result.get('version')}" if result["ok"] else
                                                      f" -> {result['error']['code']}: {result['error']['message']}"))
@@ -57,16 +62,19 @@ def deploy_with_fixes(home: Path, src: Path, request: str, draft: dict) -> tuple
         if attempt == MAX_FIXES:
             break
         print(f"  asking the model to fix it (attempt {attempt + 1} of {MAX_FIXES})")
-        draft = ask(request, current={"app_json": draft["app_json"], "handlers_py": draft["handlers_py"]}, error=error)
+        draft = ask(request, current=draft["files"], error=error)
     return {"ok": False}, draft
 
 
-def run_examples(home: Path, name: str, examples: list[dict]) -> str:
+def run_examples(home: str, name: str, examples: list[dict]) -> str:
     rt = Runtime(home, name)
     ok = refused = failed = 0
     try:
         for ex in examples:
-            r = rt.call(ex.get("handler"), ex.get("caller", "alice"), ex.get("args") or {})
+            # In-process calls take the user directly (what a login token would resolve to).
+            caller = ex.get("caller", "alice")
+            user = User(caller, tuple(ex.get("roles") or ())) if isinstance(caller, str) else None
+            r = rt.call(ex.get("handler"), user, ex.get("args") or {})
             if r["ok"]:
                 ok, tag = ok + 1, "ok     "
             elif r["error"]["kind"] == "app":
@@ -74,7 +82,8 @@ def run_examples(home: Path, name: str, examples: list[dict]) -> str:
             else:
                 failed, tag = failed + 1, "ERROR  "
             shown = json.dumps(r["result"] if r["ok"] else r["error"])[:200]
-            print(f"  {tag} {ex.get('caller')}: {ex.get('handler')}({json.dumps(ex.get('args') or {})}) -> {shown}")
+            who = f"{caller}{' ' + str(ex.get('roles')) if ex.get('roles') else ''}" if caller else "anonymous"
+            print(f"  {tag} {who}: {ex.get('handler')}({json.dumps(ex.get('args') or {})}) -> {shown}")
     finally:
         rt.close()
     return f"{ok} ok, {refused} refused by the app on purpose, {failed} errors (of {len(examples)} example calls)"
@@ -94,11 +103,11 @@ def main(args: list[str], keep: bool) -> int:
         os.environ["DEEPSEEK_API_KEY"] = key
     request = " ".join(args) or DEFAULT_REQUEST
     work = Path(tempfile.mkdtemp(prefix="neai-try-ai-"))
-    home, verdicts = work / "home", []
+    home, verdicts = scratch_database("neai_try_ai"), []
     try:
         step(f"1. Generate an app: {request!r}")
         draft = ask(request)
-        print("  app.json:\n" + "\n".join("    " + line for line in draft["app_json"].splitlines()))
+        print("  app.json:\n" + "\n".join("    " + line for line in draft["files"]["app.json"].splitlines()))
         result, draft = deploy_with_fixes(home, work / "app", request, draft)
         if not result["ok"]:
             print("\nRESULT: the generated app could not be deployed, even after fixes.")
@@ -110,8 +119,7 @@ def main(args: list[str], keep: bool) -> int:
         verdicts.append("first version: " + run_examples(home, name, draft["examples"]))
 
         step(f"3. Ask for a change: {CHANGE_REQUEST!r}")
-        current = {"app_json": draft["app_json"], "handlers_py": draft["handlers_py"]}
-        change = ask(CHANGE_REQUEST, current=current)
+        change = ask(CHANGE_REQUEST, current=draft["files"])
         result2, change = deploy_with_fixes(home, work / "app", CHANGE_REQUEST, change)
         if result2.get("status") == "unchanged":
             verdicts.append("the model returned identical files for the change (nothing new to deploy)")

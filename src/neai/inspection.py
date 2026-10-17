@@ -1,56 +1,96 @@
 from __future__ import annotations
 
-import os
 from typing import Any
 
-from .paths import read_server_info, require_app, resolve_home
+from .database import Database, safe_url
+from .errors import NeaiError
+from .loader import parse_definition
 from .schema import parse_manifest
-from .store import Store
+from .store import Store, require_app
 
 
-def inspect_app(home: str | os.PathLike[str] | None, name: str, *, records: int = 20, logs: int = 20) -> dict[str, Any]:
-    home = resolve_home(home)
-    store = Store(require_app(home, name))
+def inspect_app(database: str | None, name: str, *, records: int = 20, logs: int = 20) -> dict[str, Any]:
+    db = Database(database)
     try:
-        active = store.active_version()
-        info = store.get_version(active) if active else None
+        store = require_app(db, name)
+        app = store.info()
+        active = app["active_version"]
+        info = store.get_version(active, files=True) if active else None
         manifest = info["manifest"] if info else None
         counts = store.count_by_collection()
 
         data: dict[str, Any] = {}
         collections = list(manifest["collections"]) if manifest else []
         for coll in collections + sorted(set(counts) - set(collections)):
-            rows = [r for _, r in store.iter_records(coll)]
+            order = ["id", *(manifest["collections"].get(coll, {}) if manifest else {})]
+            rows = [_ordered(r, order) for _, r in store.iter_records(coll)]
             data[coll] = {"count": len(rows), "records": rows[-records:] if records else []}
             if len(rows) > records:
                 data[coll]["showing"] = f"last {records} of {len(rows)} (use --records N)"
 
         deploys = store.deploys(limit=10)
-        server = read_server_info(home, name)
+        instances = store.instances()
         return {
             "ok": True,
             "app": {
                 "name": name,
-                "id": store.get_meta("app_id"),
-                "created_at": store.get_meta("created_at"),
+                "id": app["id"],
+                "created_at": app["created_at"],
                 "description": (manifest or {}).get("description"),
-                "source_dir": store.get_meta("source_dir"),
-                "store": str(store.dir),
+                "source_dir": app["source_dir"],
+                "database": safe_url(db.url),
             },
             "active_version": (
-                {"version": info["version"], "hash": info["hash"], "activated_at": info["activated_at"]} if info else None
+                {"version": info["version"], "hash": info["hash"], "activated_at": info["activated_at"],
+                 "files": sorted(info["files"])} if info else None
             ),
+            "versions": store.versions()[:10],
             "handlers": parse_manifest(manifest).handler_list() if manifest else [],
-            "schema": (manifest or {}).get("collections", {}),
+            "schema": _schema(manifest, info["files"] if info else {}),
+            "unique": (manifest or {}).get("unique", {}),
+            "auth": {**((manifest or {}).get("auth") or {"signup": "open", "roles": []}),
+                     "users": len(store.list_users())},
+            "workflows": _workflows(store, info["files"]) if info else {},
             "data": data,
             "latest_rejected": latest_rejected(deploys),
             "recent_deploys": deploys[:5],
             "recent_errors": store.logs(limit=logs, errors_only=True),
             "recent_logs": store.logs(limit=logs),
-            "server": {"running": True, **server} if server else {"running": False},
+            "server": ({"running": True, "url": instances[0]["url"], "instances": instances} if instances
+                       else {"running": False, "instances": []}),
         }
     finally:
-        store.close()
+        db.close()
+
+
+def _ordered(record: dict[str, Any], order: list[str]) -> dict[str, Any]:
+    return {**{k: record[k] for k in order if k in record}, **record}
+
+
+def _schema(manifest: dict[str, Any] | None, files: dict[str, str]) -> dict[str, Any]:
+    schema = {c: {f: dict(spec) for f, spec in fields.items()} for c, fields in (manifest or {}).get("collections", {}).items()}
+    try:
+        workflows = parse_definition(files).workflows if files else {}
+    except NeaiError:
+        workflows = {}
+    for name, wf in workflows.items():
+        spec = schema.get(wf.collection, {}).get(wf.field)
+        if spec is not None:
+            spec.pop("default", None)  # how the platform starts records there, not something to declare
+            spec["managed_by_workflow"] = name
+    return schema
+
+
+def _workflows(store: Store, files: dict[str, str]) -> dict[str, Any]:
+    try:
+        workflows = parse_definition(files).workflows
+    except NeaiError:
+        return {}
+    out = {}
+    for name, wf in workflows.items():
+        counts = store.count_by_value(wf.collection, wf.field)
+        out[name] = {**wf.to_dict(), "records_per_step": {s: counts.get(s, 0) for s in (*wf.step_names, *wf.exits)}}
+    return out
 
 
 def latest_rejected(deploys: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -62,11 +102,11 @@ def latest_rejected(deploys: list[dict[str, Any]]) -> dict[str, Any] | None:
     return None
 
 
-def app_logs(home: str | os.PathLike[str] | None, name: str, *, limit: int = 50, errors_only: bool = False,
+def app_logs(database: str | None, name: str, *, limit: int = 50, errors_only: bool = False,
              handler: str | None = None) -> dict[str, Any]:
-    home = resolve_home(home)
-    store = Store(require_app(home, name))
+    db = Database(database)
     try:
+        store = require_app(db, name)
         return {"ok": True, "app": name, "logs": store.logs(limit=limit, errors_only=errors_only, handler=handler)}
     finally:
-        store.close()
+        db.close()
