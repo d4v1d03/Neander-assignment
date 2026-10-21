@@ -157,9 +157,10 @@ Records come back as plain dicts with `id` first, then the fields in the order a
 * **Read handlers can't write.** `insert`, `update` and `delete` in a `"read"` handler fail with `READ_ONLY_VIOLATION`, and the call fails even if you catch that error. Declare a handler `"write"` if it ever writes. `deploy` warns when a read handler calls `ctx.db.insert/update/delete` directly, but a write made through a helper is only caught when it runs, so call every branch at least once.
 * **A write handler is all or nothing.** If it raises anything, every write it made is rolled back. You never need to clean up after a failure.
 * **Errors from `ctx.db` are exceptions** with `.code`, `.message`, `.hint` and `.details`. If your handler catches one (other than `READ_ONLY_VIOLATION`) and carries on, the call succeeds and keeps its other writes. Prefer checking first (`get`, `count`) over catching.
-* **Writes to one app happen one at a time,** even across several servers (the platform takes a per-app lock in the database). A check followed by an insert in a write handler (e.g. "insert unless it exists") is safe from races. Read handlers don't wait for writes.
+* **Calls run at the same time.** A server handles several requests at once, on threads, and several servers can share one app. So keep no state in Python globals: a module-level counter would lose updates, and each server would have its own. Anything that must last goes in `ctx.db`.
+* **Writes to one app happen one at a time,** across every thread and every server (the platform takes a per-app lock in the database). A check followed by an insert in a write handler (e.g. "insert unless it exists") is safe from races. Read handlers don't wait for writes.
 * **Records must match the schema.** A bad type, a missing required field or an unknown field fails with `VALIDATION_ERROR`, and nothing is written.
-* **Handlers have a time limit** (5 s by default, `NEAI_HANDLER_TIMEOUT`). A stuck handler fails with `HANDLER_TIMEOUT` and is rolled back.
+* **Handlers have a time limit** (5 s by default, `NEAI_HANDLER_TIMEOUT`). A stuck handler fails with `HANDLER_TIMEOUT` and is rolled back. Don't `time.sleep` in a handler: on a server, a sleep is only stopped when it ends, though Postgres ends its transaction half a second past the limit, so it can't hold up other writes.
 * **Return plain JSON**: dict, list, str, int, float, bool or None. Tuples are returned as lists. Anything else (sets, objects, NaN) fails with `HANDLER_BAD_RESULT` and is rolled back.
 * `handlers.py` must be **one file** that imports only `neai` and the standard library. Name helper functions `_like_this`; a public function that isn't declared in app.json produces a deploy warning.
 
@@ -389,7 +390,7 @@ The check gives a friendly result; `unique` guarantees it even if a later versio
 | `neai validate <dir>` | full validation including tests.json and the schema-vs-data check; activates nothing, records nothing. `"status"` is `valid` or `rejected`; `"tests"` says how many passed |
 | `neai deploy <dir>` | validates (contract, code, tests, then stored data), then activates: `"status"` is `activated`, `unchanged` or `rejected` |
 | `neai run <dir> [--port N] [--quiet]` | deploys if changed, then serves on `127.0.0.1` (default port 8710; `--port 0` picks a free one). If the deploy is rejected but an older valid version exists, it serves that version (`"fallback": true`). |
-| `neai serve <app> [--port N] [--quiet]` | serves the active version from the database; run as many as you like |
+| `neai serve <app> [--port N] [--quiet]` | serves the active version from the database; run as many as you like. Each handles up to `NEAI_THREADS` requests at once (default 16), sharing `NEAI_DB_POOL_SIZE` database connections (default 10) |
 | `neai ps [app]` | running servers: app, url, pid |
 | `neai proxy <app> [--port N]` | one URL in front of every running server of the app (round-robin; skips dead ones) |
 | `neai signup <app> <username> [--password-stdin] [--show-token]` | creates an account through the running server and saves its login |
@@ -498,6 +499,7 @@ Errors look like `{"ok": false, "error": {"code", "kind", "message", "hint"?, "d
 | `SERVER_NOT_RUNNING` | `neai call`/`signup`/`login` found no live server for the app | start `neai serve <app>` or `neai run <dir>` |
 | `PORT_IN_USE` | something is already listening on that port | pass another `--port`, or `--port 0` |
 | `DATABASE_UNAVAILABLE` | Postgres can't be reached (the hint says where it looked) | `docker compose up -d`, or check `NEAI_DATABASE_URL`; servers reconnect by themselves |
+| `DATABASE_BUSY` | every database connection of that server stayed busy for 10 s: it's overloaded | retry shortly; run more copies behind `neai proxy`, or raise `NEAI_DB_POOL_SIZE` |
 | `NO_INSTANCE` / `INSTANCE_FAILED` | (proxy) no server of the app is running / one stopped mid-request (not retried, since it may have run) | start a server / check `neai ps` |
 | `BAD_REQUEST` / `UNSUPPORTED_MEDIA_TYPE` / `FORBIDDEN_HOST` / `BODY_TOO_LARGE` | a malformed HTTP request | send JSON `{"args": ...}` with `Content-Type: application/json` to 127.0.0.1, under 1 MiB |
 | `USAGE_ERROR` | bad CLI arguments | `neai <command> --help` |

@@ -81,7 +81,7 @@ Only then does it store the files as a new version and move the active pointer, 
 * **The list of running servers** is `neai_instances`, with a heartbeat every 5 s.
 * **The only local file left** is the CLI's saved logins, which is client state.
 
-**Writes stay one at a time per app, across servers.**
+**Writes stay one at a time per app, across threads and servers.**
 * Each write handler, and each deploy's check-then-activate, starts with `pg_advisory_xact_lock(hash(app))`.
 * So Feedback's check-then-insert vote stays race-free with any number of servers: a test races 3 connections and gets exactly one vote.
 * Reads take no lock.
@@ -104,6 +104,30 @@ The slower write is the honest cost of a database over a socket, plus the lock a
 **Display order.** Records are `jsonb`, for indexing. Contracts, errors and log data are `json`, which keeps the order they were written in (`jsonb` reorders keys).
 
 **`neai proxy`** is a small round-robin load balancer over the live instances. It moves to the next instance only when the connection *couldn't be opened*. A request that reached an instance and then failed isn't retried, because a write might already have run.
+
+## Concurrency: many requests at once in each server
+
+**The problem.** v2's servers handled one request at a time, so a slow request held up every other one. The dashboard showed it worst: while DeepSeek worked on a Generate (up to two minutes), the app list wouldn't even load. Stateless copies behind the proxy were the only way to scale.
+
+**Now each server runs requests on threads.** It handles up to 16 at once (`NEAI_THREADS`). When all of them are busy, new connections wait in the operating system's queue rather than piling up threads. The dashboard works the same way. Threads help because almost all of a request's time is spent *waiting*, on Postgres or on DeepSeek. Heavy Python work still runs one thread at a time (the GIL), and copies behind the proxy are still the way to use more cores.
+
+**What had to change, and why.** Shared *data* was already safe, because v2's copies are separate processes and Postgres enforces the per-app write lock across all of them. What threads add is things shared *inside one process*:
+* **The database connection became a pool** (10 per server, `NEAI_DB_POOL_SIZE`). A transaction is tied to the connection it runs on, so two threads on one connection would mix their transactions; one thread's rollback could undo another's write. Now a statement borrows a connection and returns it, and a transaction keeps its own until COMMIT. When all are in use, a request waits up to 10 s, then fails with `DATABASE_BUSY` (503). Results are read in full before the connection goes back.
+* **Loading a new version takes a lock.** After a deploy, every thread notices the new version at once. One loads it, and the others wait a moment and reuse it, instead of each compiling its own copy. The usual call takes no lock, since a loaded version never changes.
+* **The time limit works on worker threads.** `SIGALRM` only reaches the main thread. On a worker, a watchdog thread raises `HANDLER_TIMEOUT` into the handler instead (CPython's `PyThreadState_SetAsyncExc`). A lock between the two makes sure it can never fire after the handler has finished, into the platform's own code. It lands between Python instructions, so it can't cut a `time.sleep` short. For that, Postgres ends any transaction left idle half a second past the limit, which releases the app's write lock.
+* **The heartbeat has its own thread,** so a server whose request threads are all busy isn't mistaken for a dead one.
+* **The dashboard locks per app.**
+  * Start and Stop: two clicks must not start two servers ("is it running? no, start it" from two threads at once).
+  * Saving and deploying a folder: two tabs must not mix their files.
+  * Different apps never wait for each other, and no lock is held while waiting on DeepSeek.
+* **DeepSeek calls are limited** to 2 at once (`NEAI_AI_CONCURRENCY`). More wait their turn, up to 90 s, then get `AI_BUSY`.
+
+**Races fixed on the way.** Threads made these easy to hit, but they could already happen across copies:
+* **Logins lock the account's row** (`SELECT ... FOR UPDATE`). Otherwise a burst of parallel wrong passwords would all read "not locked yet" and get past the 5-try lockout. A test fires 10 at once and gets exactly 5 `LOGIN_FAILED` and 5 `LOGIN_LOCKED`.
+* **Role grants lock the row too,** so two grants at the same moment both stick.
+* **A deploy compares with the active version as it is under the write lock,** not as it was before its tests ran. Another deploy may have gone live in between.
+
+**Measured** on the same Mac: 32 clients sending 800 mixed `create_note`/`list_notes` calls to one notes server took 1.7 s with 1 thread (466 req/s) and 0.9 s with 16 (902 req/s), with no errors.
 
 ## Accounts and access rules
 
@@ -238,7 +262,7 @@ That logic otherwise spreads across handlers as `if`s on a status field, where i
 
 ## Known limitations
 
-* **Handler code runs inside the server process.** Access rules, read-only handles and per-app data are enforced by the platform's API, not by a sandbox. Hostile handler code could import a database driver, allocate unbounded memory, or block in C code where the `SIGALRM` time limit can't interrupt it. The time limit also needs Unix and the main thread, which is where servers and the CLI run handlers.
+* **Handler code runs inside the server process.** Access rules, read-only handles and per-app data are enforced by the platform's API, not by a sandbox. Hostile handler code could import a database driver, allocate unbounded memory, or block in C code where the time limit can't interrupt it. On a worker thread, it could also catch the timeout (`except BaseException`) and carry on. A stuck handler holds one of its server's threads until it returns. The time limit needs CPython, and Unix for the main thread's `SIGALRM`.
 * **Workflow steps can't run on a timer,** and apps can't call outside services: there's no worker process.
 * **Steps are linear,** one workflow per collection.
 * **There are no migrations** beyond defaults. A field that holds data can't be removed.
@@ -326,7 +350,7 @@ One finding was kept as a decision: deploy *warnings* don't block a deploy. The 
 
 ## Tests
 
-`pytest` runs 165 tests in about 25 seconds, against a separate `neai_test` database that is emptied before each test. `scripts/demo.py` runs every feature end to end in its own scratch database (44 checks).
+`pytest` runs 191 tests in about 40 seconds, against a separate `neai_test` database that is emptied before each test. `scripts/demo.py` runs every feature end to end in its own scratch database (44 checks).
 
 | File | What it covers |
 |---|---|
@@ -341,3 +365,4 @@ One finding was kept as a decision: deploy *warnings* don't block a deploy. The 
 | `test_e2e.py` | the real CLI and HTTP servers: tokens, two stateless copies, the proxy surviving a dead copy, reconnecting after a database outage |
 | `test_ui.py` | the dashboard: deploys of every file, conflict prompts, sign-in, users, the static check, and DeepSeek's request formats (against a fake DeepSeek) |
 | `test_docs.py` | every example in `AGENTS.md` deploys and behaves as documented |
+| `test_concurrency.py` | many requests at once: parallel writes and `unique` rules, loading a new version once, time limits on worker threads, a sleeping handler not holding the write lock, a full pool, login bursts, parallel grants, overlapping deploys, a slow request not holding up others, the dashboard during a slow DeepSeek call, the DeepSeek limit, double Start clicks, per-app save locks |

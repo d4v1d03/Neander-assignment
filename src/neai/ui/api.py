@@ -9,8 +9,9 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from ..auth import user_admin
 from ..client import auth_request, call_server
@@ -27,13 +28,31 @@ from ..store import Store, list_apps, list_instances, require_app
 from . import ai, codecheck
 
 START_TIMEOUT_SECONDS = 20
+AI_CONCURRENCY = 2
+AI_WAIT_SECONDS = 90
 
 
 class UI:
     def __init__(self, database: str | None, apps_dir: str | os.PathLike[str]):
         self.db = Database(database)
         self.apps_dir = Path(apps_dir).resolve()
+        # The dashboard serves requests on several threads at once (two tabs, or a page loading
+        # while DeepSeek works), so everything below that they share is guarded.
+        self._lock = threading.Lock()  # guards the two dicts below
         self.children: dict[str, subprocess.Popen] = {}
+        self._locks: dict[tuple[str, str], threading.Lock] = {}
+        # A few DeepSeek calls at once; more wait their turn (each can take a minute or two).
+        self.ai_slots = max(1, int(os.environ.get("NEAI_AI_CONCURRENCY", AI_CONCURRENCY)))
+        self._ai = threading.BoundedSemaphore(self.ai_slots)
+
+    def _lock_for(self, kind: str, name: str) -> threading.Lock:
+        """One lock per app and kind of work ("server": start/stop, "folder": save + deploy).
+
+        Per app, so working on one app never waits for another. The two kinds are never held
+        together, so they can't deadlock.
+        """
+        with self._lock:
+            return self._locks.setdefault((kind, name), threading.Lock())
 
 
     def config(self) -> dict[str, Any]:
@@ -96,6 +115,11 @@ class UI:
 
     def start(self, name: str) -> dict[str, Any]:
         check_app_name(name)
+        # Check-then-start under the lock: two clicks at once must not start two servers.
+        with self._lock_for("server", name):
+            return self._start(name)
+
+    def _start(self, name: str) -> dict[str, Any]:
         if instances := list_instances(self.db, name):
             return {"ok": True, "status": "running", **instances[0]}
         # The URL goes through the environment, not argv, so a password in it isn't visible in `ps`.
@@ -124,7 +148,8 @@ class UI:
             msg = json.loads(line)
             seen.append(msg)
             if msg.get("status") == "serving":
-                self.children[name] = proc
+                with self._lock:
+                    self.children[name] = proc
                 return {**msg, "ok": True, "status": "started"}
         if proc.poll() is None:
             proc.terminate()
@@ -135,7 +160,12 @@ class UI:
 
     def stop(self, name: str) -> dict[str, Any]:
         check_app_name(name)
-        proc = self.children.pop(name, None)
+        with self._lock_for("server", name):
+            return self._stop(name)
+
+    def _stop(self, name: str) -> dict[str, Any]:
+        with self._lock:
+            proc = self.children.pop(name, None)
         if proc and proc.poll() is None:
             proc.terminate()
             proc.wait(timeout=10)
@@ -152,7 +182,9 @@ class UI:
         return {"ok": True, "status": "stopped", "app": name}
 
     def close(self) -> None:
-        for name in list(self.children):
+        with self._lock:
+            names = list(self.children)
+        for name in names:
             self.stop(name)
         self.db.close()
 
@@ -165,6 +197,13 @@ class UI:
             raise NeaiError("BAD_REQUEST", 'send {"mode": "new"|"change", "files": {"app.json": ..., ...}}')
         overwrite = body.get("overwrite") is True
         name = _manifest_name(files[MANIFEST_FILE])
+        # Check the folder, write it, deploy it: all under the app's lock, so two tabs saving the
+        # same app can't interleave their files (Postgres already orders the deploys themselves).
+        with self._lock_for("folder", name):
+            return self._deploy(name, mode, files, overwrite, body)
+
+    def _deploy(self, name: str, mode: str, files: dict[str, str], overwrite: bool,
+                body: dict[str, Any]) -> dict[str, Any]:
         if mode == "change" and name != body.get("app"):
             raise NeaiError("NAME_MISMATCH", f"this app is '{body.get('app')}', but app.json says '{name}'",
                             hint="keep the name to change this app, or use New app to create another one")
@@ -201,13 +240,29 @@ class UI:
     def generate(self, body: dict[str, Any]) -> dict[str, Any]:
         current = _clean_files(body["files"]) if body.get("files") is not None else None
         error = body.get("error") if isinstance(body.get("error"), dict) else None
-        draft = ai.generate(body.get("request"), current=current, error=error)
+        with self._ai_turn():
+            draft = ai.generate(body.get("request"), current=current, error=error)
         draft["review"] = _review(draft["files"])
         return {"ok": True, **draft}
 
     def generate_ui(self, body: dict[str, Any]) -> dict[str, Any]:
-        draft = ai.generate_ui(body.get("request") or "", files=_clean_files(body.get("files")))
+        files = _clean_files(body.get("files"))
+        with self._ai_turn():
+            draft = ai.generate_ui(body.get("request") or "", files=files)
         return {"ok": True, **draft}
+
+    @contextmanager
+    def _ai_turn(self) -> Iterator[None]:
+        # Held for the whole DeepSeek call: limiting those is its job. No other lock is held
+        # while waiting on DeepSeek, so a slow answer never blocks anything else.
+        if not self._ai.acquire(timeout=AI_WAIT_SECONDS):
+            raise NeaiError("AI_BUSY", f"{self.ai_slots} DeepSeek request(s) already running, "
+                                       f"and none finished within {AI_WAIT_SECONDS}s",
+                            hint="try again in a minute (NEAI_AI_CONCURRENCY allows more at once)")
+        try:
+            yield
+        finally:
+            self._ai.release()
 
 
     def _source_dir(self, name: str) -> Path | None:

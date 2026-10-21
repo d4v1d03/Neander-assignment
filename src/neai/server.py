@@ -4,9 +4,9 @@ import json
 import os
 import signal
 import sys
-import time
+import threading
 import uuid
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -27,25 +27,53 @@ APP_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'se
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8710
 MAX_BODY_BYTES = 1024 * 1024
+# Requests one server handles at once (NEAI_THREADS). Each one doing database work holds one of
+# the runtime's pooled connections (NEAI_DB_POOL_SIZE) while it does.
+DEFAULT_THREADS = 16
 CALL_KEYS = {"args"}
 AUTH_KEYS = {"username", "password"}
 
 
-class LocalServer(HTTPServer):
-    allow_reuse_address = True
+class LocalServer(ThreadingHTTPServer):
+    """Handles each request on its own thread, at most `threads` at once.
 
-    def __init__(self, port: int, handler: type[BaseHTTPRequestHandler], quiet: bool = False):
+    When every thread is busy, new connections wait in the operating system's queue until one
+    is free, rather than piling up threads without limit.
+    """
+
+    allow_reuse_address = True
+    daemon_threads = True  # Ctrl+C doesn't wait for requests in flight; their transactions roll back
+    request_queue_size = 64
+
+    def __init__(self, port: int, handler: type[BaseHTTPRequestHandler], quiet: bool = False,
+                 threads: int | None = None):
         super().__init__((HOST, port), handler)
         self.quiet = quiet
+        self.threads = max(1, threads or int(os.environ.get("NEAI_THREADS", DEFAULT_THREADS)))
+        self._free = threading.BoundedSemaphore(self.threads)
         actual = self.server_address[1]
         self.allowed_hosts = {f"127.0.0.1:{actual}", f"localhost:{actual}", "127.0.0.1", "localhost"}
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        self._free.acquire()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._free.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._free.release()
 
 
 class LocalJSONHandler(BaseHTTPRequestHandler):
     server: LocalServer
     server_version = "neai"
     sys_version = ""
-    # Single-threaded server: a client that connects and then stalls must not block everyone.
+    # A client that connects and then stalls must not hold a thread for long.
     timeout = 10
 
     def _host_ok(self) -> bool:
@@ -105,23 +133,27 @@ class AppServer(LocalServer):
         self.runtime = runtime
         self.instance_id = str(uuid.uuid4())
         self.url = f"http://{HOST}:{self.server_address[1]}"
-        self._last_beat = 0.0
+        self._stopping = threading.Event()
+        self._beats: threading.Thread | None = None
 
     def register(self) -> None:
         self.runtime.store.register_instance(self.instance_id, self.url)
-        self._last_beat = time.monotonic()
+        # Its own thread, so it keeps going even while every request thread is busy.
+        self._beats = threading.Thread(target=self._heartbeat, name="neai-heartbeat", daemon=True)
+        self._beats.start()
 
-    def service_actions(self) -> None:
-        # Called by serve_forever between requests: tell the database this instance is alive.
-        if time.monotonic() - self._last_beat < HEARTBEAT_SECONDS:
-            return
-        self._last_beat = time.monotonic()
-        try:
-            self.runtime.store.heartbeat(self.instance_id, self.url)
-        except NeaiError:
-            pass  # the database is away; the next heartbeat re-registers this instance
+    def _heartbeat(self) -> None:
+        # Tell the database this instance is alive, every few seconds, until the server stops.
+        while not self._stopping.wait(HEARTBEAT_SECONDS):
+            try:
+                self.runtime.store.heartbeat(self.instance_id, self.url)
+            except NeaiError:
+                pass  # the database is away; the next heartbeat re-registers this instance
 
     def unregister(self) -> None:
+        self._stopping.set()
+        if self._beats is not None:
+            self._beats.join(timeout=2)
         try:
             self.runtime.store.remove_instance(self.instance_id)
         except NeaiError:
@@ -277,6 +309,7 @@ def serve(database: str | None, name: str, *, port: int = DEFAULT_PORT, out: Tex
                                      "message": f"serving on {httpd.url}"}])
         except NeaiError as err:
             httpd.server_close()
+            httpd.unregister()
             _emit(out, error_envelope(err))
             return 1
 

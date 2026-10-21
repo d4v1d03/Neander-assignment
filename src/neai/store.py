@@ -255,10 +255,13 @@ class Store:
                               (self.app, username, password_hash, jsonb(roles))).fetchone()
         return row is not None
 
-    def get_user(self, username: str) -> dict[str, Any] | None:
+    def get_user(self, username: str, *, for_update: bool = False) -> dict[str, Any] | None:
+        # for_update (inside a transaction): lock the row until COMMIT, so read-then-change steps
+        # on one account (a login attempt, a role change) happen one at a time.
         row = self.db.execute(
             "SELECT username, password_hash, roles, created_at, failed_logins, locked_until, "
-            "COALESCE(locked_until > now(), false) FROM neai_users WHERE app = %s AND username = %s",
+            "COALESCE(locked_until > now(), false) FROM neai_users WHERE app = %s AND username = %s"
+            + (" FOR UPDATE" if for_update else ""),
             (self.app, username)).fetchone()
         if not row:
             return None

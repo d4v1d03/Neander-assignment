@@ -84,12 +84,19 @@ def deploy_files(db: Database, files: dict[str, str], manifest: Manifest, *, sou
     try:
         warnings, loaded = _check_code(manifest, files, digest)
         tests = run_tests(store.db, manifest, loaded, files)
-        old_manifest = _active_manifest(store, active) if active_info else None
-        schema_changed = old_manifest is not None and old_manifest.data_contract() != manifest.data_contract()
 
         with store.transaction(write=True):
-            # Checked while holding the app's write lock, so no write can slip in between the
-            # compatibility check and the activation.
+            # Compared with the active version as it is now, under the app's write lock: another
+            # deploy may have gone live while this one ran its tests, and no write can slip in
+            # between the compatibility check and the activation.
+            active = store.active_version()
+            active_info = store.get_version(active) if active else None
+            if active_info and active_info["hash"] == digest and not dry_run:
+                store.add_deploy("unchanged", digest=digest, version=active, source=source)
+                return {"ok": True, "status": "unchanged", "app": manifest.name, "version": active, "hash": digest,
+                        "warnings": warnings, "message": f"identical to active version {active}; nothing to do"}
+            old_manifest = _active_manifest(store, active) if active_info else None
+            schema_changed = old_manifest is not None and old_manifest.data_contract() != manifest.data_contract()
             if schema_changed:
                 _check_compatible(store, old_manifest, manifest)
                 _check_workflow_steps(store, manifest)

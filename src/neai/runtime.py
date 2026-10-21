@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
@@ -33,16 +34,29 @@ SENSITIVE_KEY = re.compile(r"pass(word)?|secret|token|api[_-]?key|authorization|
 
 @contextmanager
 def time_limit(seconds: float | None, *, what: str = "handler") -> Iterator[None]:
-    usable = (
-        seconds
-        and seconds > 0
-        and hasattr(signal, "setitimer")
-        and threading.current_thread() is threading.main_thread()
-    )
-    if not usable:
+    """Raise HandlerTimeout in this thread if the block runs longer than `seconds`.
+
+    On the main thread a SIGALRM interrupts it (even mid-sleep). Servers run each request on a
+    worker thread, which signals can't reach, so there a watchdog thread raises the exception
+    into the worker instead. Either way it lands between two Python bytecodes: code blocked
+    inside a C call is stopped once that call returns, and a stuck query by statement_timeout.
+    """
+    if not seconds or seconds <= 0:
         yield
         return
+    if threading.current_thread() is threading.main_thread() and hasattr(signal, "setitimer"):
+        with _alarm(seconds, what):
+            yield
+        return
+    if _set_async_exc is None:  # not CPython: no way to interrupt a thread
+        yield
+        return
+    with _watchdog(seconds):
+        yield
 
+
+@contextmanager
+def _alarm(seconds: float, what: str) -> Iterator[None]:
     def on_alarm(signum: int, frame: Any) -> None:
         raise HandlerTimeout(what)
 
@@ -53,6 +67,39 @@ def time_limit(seconds: float | None, *, what: str = "handler") -> Iterator[None
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
+
+
+@contextmanager
+def _watchdog(seconds: float) -> Iterator[None]:
+    target = threading.get_ident()
+    guard = threading.Lock()
+    state = {"done": False, "fired": False}
+
+    def fire() -> None:
+        # Under the guard, so it can't fire once the block below has finished: the exception
+        # must never land in the platform's own code after the handler returned.
+        with guard:
+            if not state["done"]:
+                state["fired"] = True
+                _set_async_exc(ctypes.c_ulong(target), ctypes.py_object(HandlerTimeout))
+
+    timer = threading.Timer(seconds, fire)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        with guard:
+            state["done"] = True
+            fired = state["fired"]
+        timer.cancel()
+        if fired:
+            # It may not have been delivered yet: cancel it, and raise it here, at a known point.
+            _set_async_exc(ctypes.c_ulong(target), None)
+            raise HandlerTimeout()
+
+
+_set_async_exc = getattr(getattr(ctypes, "pythonapi", None), "PyThreadState_SetAsyncExc", None)
 
 
 @dataclass(frozen=True)
@@ -74,11 +121,15 @@ class Runtime:
         if timeout is None:
             timeout = float(os.environ.get("NEAI_HANDLER_TIMEOUT", DEFAULT_TIMEOUT_SECONDS))
         self.timeout = timeout
-        # The database also stops a single runaway query, a second after the handler's own limit.
-        self.db = Database(database, statement_timeout=timeout + 1 if timeout else None)
+        # The database also stops a single runaway query, a second after the handler's own limit,
+        # and a transaction left idle half a second past it.
+        self.db = Database(database, statement_timeout=timeout + 1 if timeout else None,
+                           idle_timeout=timeout + 0.5 if timeout else None)
         self.store = require_app(self.db, self.name)
         self.accounts = Accounts(self.store)
         self._loaded: LoadedVersion | None = None
+        # Many request threads may notice a new deploy at once; one loads it, the rest wait and reuse it.
+        self._reload_lock = threading.Lock()
 
     @classmethod
     def sandbox(cls, db: Database, store: Any, loaded: LoadedVersion) -> "Runtime":
@@ -88,6 +139,7 @@ class Runtime:
         rt.timeout = float(os.environ.get("NEAI_HANDLER_TIMEOUT", DEFAULT_TIMEOUT_SECONDS))
         rt.db, rt.store, rt.accounts = db, store, Accounts(store)
         rt._loaded, rt._fixed = loaded, True
+        rt._reload_lock = threading.Lock()
         return rt
 
     def close(self) -> None:
@@ -100,8 +152,18 @@ class Runtime:
         if active is None:
             self._loaded = None
             return None
-        if self._loaded and self._loaded.version == active:
-            return self._loaded
+        loaded = self._loaded
+        if loaded and loaded.version == active:
+            return loaded  # the usual case: no lock, since a loaded version never changes
+        with self._reload_lock:
+            loaded = self._loaded
+            if loaded and loaded.version == active:
+                return loaded  # another thread loaded it while this one waited
+            loaded = self._load(active)
+            self._loaded = loaded
+            return loaded
+
+    def _load(self, active: int) -> LoadedVersion:
         info = self.store.get_version(active, files=True)
         files = info["files"]
         path = code_filename(self.name, f"v{active}")
@@ -115,8 +177,7 @@ class Runtime:
             raise NeaiError("HANDLER_IMPORT_ERROR", f"importing the app's code took longer than {self.timeout:g}s",
                             hint="don't do slow work at import time") from None
         sources = (path, flows_path) if flows else (path,)
-        self._loaded = LoadedVersion(active, info["hash"], parse_definition(files), module, flows, sources, files)
-        return self._loaded
+        return LoadedVersion(active, info["hash"], parse_definition(files), module, flows, sources, files)
 
     def contract(self) -> dict[str, Any]:
         """What a UI needs to know about the app, and nothing more: no code, no data, no rule details."""

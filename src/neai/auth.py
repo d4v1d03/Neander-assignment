@@ -121,7 +121,9 @@ class Accounts:
         if not isinstance(username, str) or not isinstance(password, str) or not USERNAME_RE.match(username):
             raise failed
         with self.store.db.transaction():
-            row = self.store.get_user(username)
+            # Locked: parallel attempts on one account take turns, so each wrong password is
+            # counted before the next is checked and a burst can't get past the lockout.
+            row = self.store.get_user(username, for_update=True)
             if row is None:
                 _waste_time_like_a_real_check(password)
                 raise failed
@@ -179,15 +181,18 @@ class Accounts:
 
     def grant(self, manifest: Manifest, username: str, role: str) -> User:
         self._check_role(manifest, role)
-        user = self._require(username)
-        roles = list(dict.fromkeys([*user["roles"], role]))
-        self.store.set_roles(username, roles)
+        # Read, change, write the role list with the row locked: two grants at once both stick.
+        with self.store.db.transaction():
+            user = self._require(username, lock=True)
+            roles = list(dict.fromkeys([*user["roles"], role]))
+            self.store.set_roles(username, roles)
         return User(username, tuple(roles))
 
     def revoke(self, username: str, role: str) -> User:
-        user = self._require(username)
-        roles = [r for r in user["roles"] if r != role]
-        self.store.set_roles(username, roles)
+        with self.store.db.transaction():
+            user = self._require(username, lock=True)
+            roles = [r for r in user["roles"] if r != role]
+            self.store.set_roles(username, roles)
         return User(username, tuple(roles))
 
     def set_password(self, username: str, password: Any) -> int:
@@ -203,8 +208,8 @@ class Accounts:
         self._require(username)
         self.store.delete_user(username)
 
-    def _require(self, username: str) -> dict[str, Any]:
-        user = self.store.get_user(username) if isinstance(username, str) else None
+    def _require(self, username: str, *, lock: bool = False) -> dict[str, Any]:
+        user = self.store.get_user(username, for_update=lock) if isinstance(username, str) else None
         if user is None:
             raise NeaiError("USER_NOT_FOUND", f"'{self.store.app}' has no user {username!r}",
                             hint=f"see who exists with `neai users {self.store.app} list`")

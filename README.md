@@ -14,6 +14,7 @@ Also new:
 * `unique` rules and field defaults;
 * `neai rollback`;
 * the dashboard can edit every file, and DeepSeek can write workflows and UIs.
+* **threads:** each server, and the dashboard, handles several requests at once (a slow one no longer holds up the rest), with a pool of database connections. `NEAI_THREADS` and `NEAI_DB_POOL_SIZE` tune it; see [DESIGN.md](DESIGN.md#concurrency-many-requests-at-once-in-each-server).
 
 ## Setup
 
@@ -80,7 +81,7 @@ neai call hiring history --as sam --args '{"id": 2}'
 ## Tests
 
 ```bash
-pytest                     # 174 tests (they use their own neai_test database)
+pytest                     # 191 tests (they use their own neai_test database)
 python scripts/demo.py     # every feature end to end (44 checks)
 ```
 
